@@ -51,6 +51,8 @@ int main() {
             }
         }
         
+        if (best != -1 && n_executed >= 1000) priority_pid = state->slots[best].pid;
+        
         printf("%d pending, %d PID priority, %d executed",
                n_pending, priority_pid, n_executed);
         
