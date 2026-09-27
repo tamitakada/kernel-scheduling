@@ -35,6 +35,7 @@ int main() {
 
         pthread_mutex_lock(&state->mutex);
         int best = -1;
+        int last_idx = -1;
         
         int n_pending = 0;
         for (int i = 0; i < MAX_PENDING; i++) {
@@ -48,8 +49,12 @@ int main() {
                     best = i;
                 else if (n_executed >= 1000 && priority_pid != state->slots[i].pid)
                     best = i;
+                
+                last_idx = i;
             }
         }
+        
+        if (n_pending && best == -1) best = last_idx;
         
         if (best != -1 && n_executed >= 1000) priority_pid = state->slots[best].pid;
         
