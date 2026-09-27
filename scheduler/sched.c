@@ -40,11 +40,13 @@ int main() {
         for (int i = 0; i < MAX_PENDING; i++) {
             if (state->slots[i].active && !state->slots[i].ready) {
                 n_pending++;
-                if (priority_pid == 0 && n_executed < 1000) {
+                
+                if (priority_pid == 0 && n_executed < 1000)
                     priority_pid = state->slots[i].pid;
+                
+                if (n_executed < 1000 && priority_pid == state->slots[i].pid)
                     best = i;
-                }
-                else if (priority_pid == state->slots[i].pid && n_executed < 1000)
+                else if (n_executed >= 1000 && priority_pid != state->slots[i].pid)
                     best = i;
             }
         }
