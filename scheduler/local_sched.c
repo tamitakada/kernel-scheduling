@@ -9,6 +9,8 @@
 #include <string.h>
 
 
+static SchedulerSharedState* state = NULL;
+
 void request_launch_permission(const char* kernel_name, int priority) {
     pthread_mutex_lock(&state->mutex);
     int slot = -1;
@@ -56,9 +58,6 @@ static void CUPTIAPI callback(void* userdata, CUpti_CallbackDomain domain,
         }
     }
 }
-
-
-static SchedulerSharedState* state = NULL;
 
 __attribute__((constructor))
 static void init_cupti(void) {
