@@ -178,17 +178,34 @@ class L2Extension:
 
         phys = int(bt[0, blk_idx].item())       # sync; fine for a demo
         blk = _kv_token_tensor(kv, st["which"], phys)   # one K (or V) block
-        # Rank-agnostic: a block holds block_size tokens back to back
-        # ([bs,H,D], [bs,H*D], or flat), as long as it is contiguous (NHD).
-        if blk.numel() % bs != 0 or not blk.is_contiguous():
+        kv_dim_stride = kv.stride(0) if kv.shape[0] == 2 else kv.stride(1)
+        e = blk.element_size()
+        tok0 = blk[0]
+        if blk.shape[0] != bs or not tok0.is_contiguous():
             raise RuntimeError(
-                f"KV block not token-contiguous or bad block_size: "
-                f"block shape={tuple(blk.shape)} stride={blk.stride()} bs={bs}. "
-                "HND layout? Pick a backend with NHD layout.")
-        tok_elems = blk.numel() // bs
+                f"Unsupported KV block: shape={tuple(blk.shape)} "
+                f"stride={blk.stride()} bs={bs}")
+        r = tok0.numel()        # elements of K (or V) for one token
+        p = blk.stride(0)       # elements between consecutive tokens
 
-        ptr = blk.data_ptr() + lo * tok_elems * blk.element_size()
-        nbytes = (hi - lo) * tok_elems * blk.element_size()
+        if p == r:
+            # K (or V) of consecutive tokens is back to back: window = just
+            # the selected half.
+            ptr = blk.data_ptr() + lo * p * e
+            nbytes = (hi - lo) * r * e
+            mode = "kv-separate"
+        elif p == 2 * r and kv_dim_stride == r:
+            # K and V interleaved per token: [tok][K(r) V(r)]. One contiguous
+            # span starting at K of token `lo` covers K *and* V of all
+            # target tokens.
+            k_blk = _kv_token_tensor(kv, 0, phys)
+            ptr = k_blk.data_ptr() + lo * p * e
+            nbytes = (hi - lo) * p * e
+            mode = "kv-interleaved"
+        else:
+            raise RuntimeError(
+                f"Unhandled KV layout: block shape={tuple(blk.shape)} "
+                f"stride={blk.stride()} kv_dim_stride={kv_dim_stride}")
         if nbytes > st["max_window"]:
             raise RuntimeError("window exceeds cudaDevAttrMaxAccessPolicyWindowSize")
 
@@ -199,6 +216,7 @@ class L2Extension:
         st["n_calls"] += 1
         if len(st["log"]) < 4:
             st["log"].append(dict(layer=module.layer_name, phys_block=phys,
+                                  mode=mode,
                                   tokens=(blk_idx * bs + lo, blk_idx * bs + hi),
                                   ptr=hex(ptr), nbytes=nbytes, hit_ratio=hit))
 
