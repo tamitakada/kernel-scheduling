@@ -112,7 +112,9 @@ class L2Extension:
         max_persist, max_window = ext.l2_limits()
         granted = ext.l2_set_aside(carve_bytes)
 
+        cc = getattr(self, "cache_config", None)
         st = dict(ext=ext, t0=t0, t1=t1, which=0 if which == "k" else 1,
+                  block_size=getattr(cc, "block_size", None),
                   granted=granted, max_window=max_window, applied=False,
                   log=[], n_calls=0, handles=[],
                   thrash=(torch.empty(thrash_mb << 18, dtype=torch.float32,
@@ -159,7 +161,12 @@ class L2Extension:
         if kv.numel() == 0:
             return
 
-        bs = kv.shape[2]
+        bs = st["block_size"] or kv.shape[2]
+        if not st.get("printed"):
+            st["printed"] = True
+            print(f"[l2_kv] kv_cache shape={tuple(kv.shape)} "
+                  f"stride={tuple(kv.stride())} dtype={kv.dtype} "
+                  f"block_size={bs} layer={module.layer_name}", flush=True)
         t0, t1 = st["t0"], st["t1"]
 
         # Only one window per stream and physical blocks are not contiguous,
@@ -170,14 +177,17 @@ class L2Extension:
         hi = min(t1, (blk_idx + 1) * bs) - blk_idx * bs
 
         phys = int(bt[0, blk_idx].item())       # sync; fine for a demo
-        blk = _kv_token_tensor(kv, st["which"], phys)   # [bs, H, D]
-        tok_elems = blk.shape[1] * blk.shape[2]
-        if blk.stride(0) != tok_elems or blk.stride(2) != 1:
+        blk = _kv_token_tensor(kv, st["which"], phys)   # one K (or V) block
+        # Rank-agnostic: a block holds block_size tokens back to back
+        # ([bs,H,D], [bs,H*D], or flat), as long as it is contiguous (NHD).
+        if blk.numel() % bs != 0 or not blk.is_contiguous():
             raise RuntimeError(
-                f"KV block not token-contiguous (strides {blk.stride()}); "
+                f"KV block not token-contiguous or bad block_size: "
+                f"block shape={tuple(blk.shape)} stride={blk.stride()} bs={bs}. "
                 "HND layout? Pick a backend with NHD layout.")
+        tok_elems = blk.numel() // bs
 
-        ptr = blk[lo].data_ptr()
+        ptr = blk.data_ptr() + lo * tok_elems * blk.element_size()
         nbytes = (hi - lo) * tok_elems * blk.element_size()
         if nbytes > st["max_window"]:
             raise RuntimeError("window exceeds cudaDevAttrMaxAccessPolicyWindowSize")
