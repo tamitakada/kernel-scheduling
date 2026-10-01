@@ -26,7 +26,7 @@ int main() {
     const int SLEEP_MS = 2000;
 
     cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&streams));
+    CUDA_CHECK(cudaStreamCreate(&stream));
 
     for (int i = 0; i < NUM_KERNELS; ++i) {
         sleep_kernel<<<1, 1, 0, stream>>>(i, SLEEP_MS);
