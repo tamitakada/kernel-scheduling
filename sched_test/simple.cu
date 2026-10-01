@@ -22,8 +22,8 @@ __global__ void sleep_kernel(int id, int ms) {
 }
 
 int main() {
-    const int NUM_KERNELS = 3;
-    const int SLEEP_MS = 3000;
+    const int NUM_KERNELS = 5;
+    const int SLEEP_MS = 2000;
 
     cudaStream_t streams[NUM_KERNELS];
     for (int i = 0; i < NUM_KERNELS; ++i) {
