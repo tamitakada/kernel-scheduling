@@ -37,10 +37,8 @@ int main() {
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     
-    for (int i = 0; i < NUM_KERNELS; ++i) {
+    for (int i = 0; i < NUM_KERNELS; ++i) 
         CUDA_CHECK(cudaStreamDestroy(streams[i]));
-    }
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
+    
     return 0;
 }
