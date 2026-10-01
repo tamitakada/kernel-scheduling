@@ -1,0 +1,326 @@
+// agent.c
+//
+// LD_PRELOAD this into each vLLM process. Intercepts kernel launches via
+// CUPTI, registers each one into a queue in shared memory owned by a
+// SEPARATE scheduler_daemon process, blocks until that daemon releases this
+// specific launch, and -- if the daemon attached a prefetch instruction --
+// executes the prefetch kernel locally (necessarily: only this process's
+// own context can validly touch its own weight memory; see shared_state.h).
+//
+// This file never creates the shared-memory segment -- it only opens one
+// that scheduler_daemon already created. Start the daemon first.
+//
+// BUILD:
+//   CUDA_ROOT=/path/to/cuda
+//   gcc -shared -fPIC -std=gnu11 -o agent.so agent.c \
+//       -I$CUDA_ROOT/include -I$CUDA_ROOT/extras/CUPTI/include \
+//       -L$CUDA_ROOT/extras/CUPTI/lib64 \
+//       -lcuda -lcupti -lnvrtc -lpthread -lrt -ldl
+//
+// RUN:
+//   ./scheduler_daemon &                       # once, before any vLLM process
+//   LD_PRELOAD=./agent.so python process_a.py &
+//   LD_PRELOAD=./agent.so python process_b.py &
+
+#define _GNU_SOURCE
+#include "shared_state.h"
+#include <cuda.h>
+#include <cupti.h>
+#include <nvrtc.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static SchedulerSharedState* g_state = NULL;
+
+/* ======================================================================
+ * EXPORTED API: called from Python via ctypes.CDLL("./agent.so")
+ * ====================================================================== */
+
+void register_weight_region(const char* tag, void* ptr, size_t nbytes) {
+    pthread_mutex_lock(&g_state->mutex);
+    if (g_state->region_count < MAX_REGIONS) {
+        int i = g_state->region_count++;
+        g_state->regions[i].owner_pid = getpid();
+        strncpy(g_state->regions[i].tag, tag, NAME_LEN - 1);
+        g_state->regions[i].ptr = ptr;
+        g_state->regions[i].nbytes = nbytes;
+        g_state->regions[i].active = 1;
+        fprintf(stderr, "[agent pid=%d] registered region tag=%s ptr=%p size=%zu\n",
+                getpid(), tag, ptr, nbytes);
+    } else {
+        fprintf(stderr, "[agent pid=%d] WARNING: region table full, dropped tag=%s\n",
+                getpid(), tag);
+    }
+    pthread_mutex_unlock(&g_state->mutex);
+}
+
+static int find_own_region(const char* tag, void** out_ptr, size_t* out_nbytes) {
+    int found = 0;
+    pid_t mypid = getpid();
+    pthread_mutex_lock(&g_state->mutex);
+    for (int i = 0; i < g_state->region_count; i++) {
+        if (g_state->regions[i].active &&
+            g_state->regions[i].owner_pid == mypid &&
+            strcmp(g_state->regions[i].tag, tag) == 0) {
+            *out_ptr = g_state->regions[i].ptr;
+            *out_nbytes = g_state->regions[i].nbytes;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_state->mutex);
+    return found;
+}
+
+/* ======================================================================
+ * NVTX layer tagging -- same mechanism as before. Verify this resolves via
+ * plain LD_PRELOAD in your build the same way you checked cudaLaunchKernel:
+ *   nm -D libtorch*.so | grep -i nvtxRangePush
+ * ====================================================================== */
+
+#define MAX_NVTX_STACK 32
+static __thread char t_nvtx_stack[MAX_NVTX_STACK][NAME_LEN];
+static __thread int  t_nvtx_depth = 0;
+
+typedef int (*nvtxRangePushA_t)(const char*);
+static nvtxRangePushA_t real_nvtxRangePushA = NULL;
+
+int nvtxRangePushA(const char* message) {
+    if (!real_nvtxRangePushA) {
+        real_nvtxRangePushA = (nvtxRangePushA_t)dlsym(RTLD_NEXT, "nvtxRangePushA");
+    }
+    if (t_nvtx_depth < MAX_NVTX_STACK) {
+        strncpy(t_nvtx_stack[t_nvtx_depth], message, NAME_LEN - 1);
+        t_nvtx_depth++;
+    }
+    return real_nvtxRangePushA ? real_nvtxRangePushA(message) : 0;
+}
+
+typedef int (*nvtxRangePop_t)(void);
+static nvtxRangePop_t real_nvtxRangePop = NULL;
+
+int nvtxRangePop(void) {
+    if (!real_nvtxRangePop) {
+        real_nvtxRangePop = (nvtxRangePop_t)dlsym(RTLD_NEXT, "nvtxRangePop");
+    }
+    if (t_nvtx_depth > 0) t_nvtx_depth--;
+    return real_nvtxRangePop ? real_nvtxRangePop() : 0;
+}
+
+static const char* current_layer_tag(void) {
+    return t_nvtx_depth > 0 ? t_nvtx_stack[t_nvtx_depth - 1] : "unknown";
+}
+
+/* ======================================================================
+ * PREFETCH KERNEL (NVRTC-compiled once) + scheduler-owned stream pool.
+ * Executed locally by whichever agent the daemon instructs -- never by the
+ * daemon itself, which has no CUDA context at all.
+ * ====================================================================== */
+
+static const char* k_prefetch_src =
+"extern \"C\" __global__ void l2_prefetch_kernel(\n"
+"    const float4* __restrict__ src, size_t n_float4, unsigned int* __restrict__ scratch) {\n"
+"    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;\n"
+"    size_t stride = (size_t)gridDim.x * blockDim.x;\n"
+"    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);\n"
+"    for (size_t i = idx; i < n_float4; i += stride) {\n"
+"        float4 v = src[i];\n"
+"        acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;\n"
+"    }\n"
+"    if (threadIdx.x == 0 && blockIdx.x == 0) {\n"
+"        atomicAdd(scratch, (unsigned int)(acc.x + acc.y + acc.z + acc.w));\n"
+"    }\n"
+"}\n";
+
+static CUfunction  g_prefetch_kernel_func = NULL;
+static CUmodule    g_prefetch_module = NULL;
+static CUdeviceptr g_prefetch_scratch = 0;
+
+static void ensure_prefetch_kernel_compiled(void) {
+    if (g_prefetch_kernel_func) return;
+
+    nvrtcProgram prog;
+    nvrtcCreateProgram(&prog, k_prefetch_src, "prefetch.cu", 0, NULL, NULL);
+    if (nvrtcCompileProgram(prog, 0, NULL) != NVRTC_SUCCESS) {
+        size_t log_size;
+        nvrtcGetProgramLogSize(prog, &log_size);
+        char* log = (char*)malloc(log_size);
+        nvrtcGetProgramLog(prog, log);
+        fprintf(stderr, "[agent pid=%d] NVRTC compile failed:\n%s\n", getpid(), log);
+        free(log);
+        nvrtcDestroyProgram(&prog);
+        return;
+    }
+
+    size_t ptx_size;
+    nvrtcGetPTXSize(prog, &ptx_size);
+    char* ptx = (char*)malloc(ptx_size);
+    nvrtcGetPTX(prog, ptx);
+    nvrtcDestroyProgram(&prog);
+
+    cuModuleLoadDataEx(&g_prefetch_module, ptx, 0, NULL, NULL);
+    cuModuleGetFunction(&g_prefetch_kernel_func, g_prefetch_module, "l2_prefetch_kernel");
+    free(ptx);
+
+    cuMemAlloc(&g_prefetch_scratch, sizeof(unsigned int));
+    fprintf(stderr, "[agent pid=%d] prefetch kernel compiled\n", getpid());
+}
+
+#define NUM_PREFETCH_STREAMS 4
+static CUstream g_prefetch_streams[NUM_PREFETCH_STREAMS];
+static int g_prefetch_streams_ready = 0;
+
+static void ensure_prefetch_streams(void) {
+    if (g_prefetch_streams_ready) return;
+    for (int i = 0; i < NUM_PREFETCH_STREAMS; i++) {
+        cuStreamCreate(&g_prefetch_streams[i], CU_STREAM_NON_BLOCKING);
+    }
+    g_prefetch_streams_ready = 1;
+}
+
+static void inject_prefetch(const char* region_tag) {
+    void* ptr; size_t nbytes;
+    if (!find_own_region(region_tag, &ptr, &nbytes)) return;
+
+    ensure_prefetch_kernel_compiled();
+    ensure_prefetch_streams();
+    if (!g_prefetch_kernel_func) return;
+
+    static int rr = 0;
+    int stream_idx = (rr++) % NUM_PREFETCH_STREAMS;
+    CUstream stream = g_prefetch_streams[stream_idx];
+
+    CUdeviceptr target = (CUdeviceptr)(uintptr_t)ptr;
+    size_t n_float4 = nbytes / sizeof(float4);
+    void* args[] = { &target, &n_float4, &g_prefetch_scratch };
+
+    int threads_per_block = 256;
+    int num_blocks = (int)((n_float4 + threads_per_block - 1) / threads_per_block);
+    if (num_blocks < 1) num_blocks = 1;
+    if (num_blocks > 2048) num_blocks = 2048;
+
+    cuLaunchKernel(g_prefetch_kernel_func,
+                   num_blocks, 1, 1,
+                   threads_per_block, 1, 1,
+                   0, stream, args, NULL);
+
+    fprintf(stderr, "[agent pid=%d] injected prefetch tag=%s stream_idx=%d\n",
+            getpid(), region_tag, stream_idx);
+}
+
+/* ======================================================================
+ * CLIENT SIDE OF THE QUEUE: register this launch with the daemon, block
+ * until released, then execute any prefetch instruction it attached.
+ * ====================================================================== */
+
+static void request_launch_permission(const char* kernel_name, const char* layer_tag) {
+    pthread_mutex_lock(&g_state->mutex);
+    int slot = -1;
+    for (int i = 0; i < MAX_PENDING; i++) {
+        if (!g_state->slots[i].active) { slot = i; break; }
+    }
+    if (slot == -1) {
+        pthread_mutex_unlock(&g_state->mutex);
+        fprintf(stderr, "[agent pid=%d] WARNING: pending queue full, launching unscheduled\n",
+                getpid());
+        return;
+    }
+    g_state->slots[slot].pid = getpid();
+    strncpy(g_state->slots[slot].kernel_name, kernel_name, NAME_LEN - 1);
+    strncpy(g_state->slots[slot].layer_tag, layer_tag, NAME_LEN - 1);
+    g_state->slots[slot].active = 1;
+    g_state->slots[slot].ready = 0;
+    g_state->slots[slot].has_prefetch = 0;
+    pthread_mutex_unlock(&g_state->mutex);
+
+    sem_post(&g_state->new_request_sem);   // wake the daemon
+    sem_wait(&g_state->slots[slot].wake_sem); // block until IT releases THIS slot
+
+    pthread_mutex_lock(&g_state->mutex);
+    int has_prefetch = g_state->slots[slot].has_prefetch;
+    char prefetch_tag[NAME_LEN];
+    if (has_prefetch) strncpy(prefetch_tag, g_state->slots[slot].prefetch_tag, NAME_LEN - 1);
+    g_state->slots[slot].active = 0;
+    pthread_mutex_unlock(&g_state->mutex);
+
+    if (has_prefetch) {
+        inject_prefetch(prefetch_tag);
+    }
+}
+
+/* ======================================================================
+ * CUPTI CALLBACK
+ * ====================================================================== */
+
+static CUpti_SubscriberHandle g_subscriber;
+
+static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
+                                     CUpti_CallbackId cbid, const void* cbdata) {
+    (void)userdata;
+    if (domain != CUPTI_CB_DOMAIN_DRIVER_API) return;
+    if (cbid != CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel &&
+        cbid != CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx) return;
+
+    const CUpti_CallbackData* data = (const CUpti_CallbackData*)cbdata;
+    if (data->callbackSite != CUPTI_API_ENTER) return;
+
+    const char* layer_tag = current_layer_tag();
+    const char* kernel_name = data->functionName ? data->functionName : "unknown";
+
+    request_launch_permission(kernel_name, layer_tag);
+    // returning here lets CUPTI/the driver proceed with the real launch
+}
+
+/* ======================================================================
+ * INIT: open (never create) the daemon's shared memory; retry if the
+ * daemon hasn't started yet.
+ * ====================================================================== */
+
+static void open_shared_state(void) {
+    int fd = -1;
+    for (int attempt = 0; attempt < 100; attempt++) {
+        fd = shm_open(SHM_NAME, O_RDWR, 0666);
+        if (fd >= 0) break;
+        if (attempt == 0) {
+            fprintf(stderr, "[agent pid=%d] waiting for scheduler_daemon to start...\n", getpid());
+        }
+        usleep(100 * 1000);
+    }
+    if (fd < 0) {
+        fprintf(stderr, "[agent pid=%d] FATAL: scheduler_daemon never started "
+                        "(shm_open %s failed: %s)\n", getpid(), SHM_NAME, strerror(errno));
+        exit(1);
+    }
+
+    g_state = (SchedulerSharedState*)mmap(NULL, sizeof(SchedulerSharedState),
+                                          PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+
+    while (!atomic_load(&g_state->initialized)) {
+        usleep(1000);
+    }
+    fprintf(stderr, "[agent pid=%d] attached to scheduler_daemon\n", getpid());
+}
+
+__attribute__((constructor))
+static void agent_init(void) {
+    open_shared_state();
+
+    CUptiResult res = cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)cupti_callback, NULL);
+    if (res != CUPTI_SUCCESS) {
+        fprintf(stderr, "[agent pid=%d] FATAL: cuptiSubscribe failed: %d\n", getpid(), res);
+        return;
+    }
+    cuptiEnableCallback(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+                        CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel);
+    cuptiEnableCallback(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API,
+                        CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx);
+
+    fprintf(stderr, "[agent pid=%d] CUPTI subscriber attached\n", getpid());
+}
