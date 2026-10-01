@@ -121,7 +121,19 @@ int main(void) {
             }
         }
 
+        // IDLE GATE: only release if nothing is currently executing. This
+        // check-and-increment happens in the SAME locked section as the
+        // release decision, so there's no window for a second slot to be
+        // released before this one's increment is visible -- the agent
+        // only decrements once the kernel it actually launches completes
+        // (see the cuLaunchHostFunc callback in agent.c).
+        if (best != -1 && atomic_load(&state->gpu_inflight_count) != 0) {
+            best = -1; // GPU busy -- leave this candidate pending, try again later
+        }
+
         if (best != -1) {
+            atomic_fetch_add(&state->gpu_inflight_count, 1);
+
             const char* tag = policy_choose_prefetch_locked(&state->slots[best]);
             if (tag) {
                 state->slots[best].has_prefetch = 1;

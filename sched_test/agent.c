@@ -117,6 +117,33 @@ static const char* current_layer_tag(void) {
     return t_nvtx_depth > 0 ? t_nvtx_stack[t_nvtx_depth - 1] : "unknown";
 }
 
+// Set while WE are launching a kernel of our own (prefetch) through the
+// real cuLaunchKernel, so cupti_callback can recognize the recursive
+// re-entry and skip scheduling logic for it.
+static __thread int t_in_scheduler_launch = 0;
+
+/* ======================================================================
+ * GPU IDLE TRACKING: the daemon increments gpu_inflight_count itself, at
+ * the moment it releases a slot (see scheduler_daemon.c -- that's what
+ * avoids a race). This callback is enqueued via cuLaunchHostFunc right
+ * after the REAL kernel is actually submitted, and fires once that
+ * specific kernel has genuinely finished executing -- at which point we
+ * decrement, and if that brings the count to zero, wake the daemon so it
+ * can release the next pending kernel.
+ *
+ * IMPORTANT: functions passed to cuLaunchHostFunc run on an internal CUDA
+ * driver thread. They must be fast and must NOT make any CUDA API calls.
+ * An atomic decrement + sem_post is fine; nothing else should go here.
+ * ====================================================================== */
+
+static void CUDA_CB launch_completion_callback(void* userdata) {
+    (void)userdata;
+    int remaining = atomic_fetch_sub(&g_state->gpu_inflight_count, 1) - 1;
+    if (remaining == 0) {
+        sem_post(&g_state->new_request_sem); // wake the daemon to re-check idle gate
+    }
+}
+
 /* ======================================================================
  * PREFETCH KERNEL (NVRTC-compiled once) + scheduler-owned stream pool.
  * Executed locally by whichever agent the daemon instructs -- never by the
@@ -205,10 +232,18 @@ static void inject_prefetch(const char* region_tag) {
     if (num_blocks < 1) num_blocks = 1;
     if (num_blocks > 2048) num_blocks = 2048;
 
+    // REENTRANCY GUARD: this cuLaunchKernel call would otherwise be caught
+    // by our OWN CUPTI subscriber (it hooks the symbol globally, not just
+    // calls originating from the app) and recurse into request_launch_
+    // permission -- which could deadlock or spiral into the scheduler
+    // deciding to prefetch a prefetch. Set the flag so cupti_callback skips
+    // scheduling logic for this specific call.
+    t_in_scheduler_launch = 1;
     cuLaunchKernel(g_prefetch_kernel_func,
                    num_blocks, 1, 1,
                    threads_per_block, 1, 1,
                    0, stream, args, NULL);
+    t_in_scheduler_launch = 0;
 
     fprintf(stderr, "[agent pid=%d] injected prefetch tag=%s stream_idx=%d\n",
             getpid(), region_tag, stream_idx);
@@ -267,14 +302,47 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
     if (cbid != CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel &&
         cbid != CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx) return;
 
+    // Skip our OWN prefetch launches entirely -- see inject_prefetch().
+    if (t_in_scheduler_launch) return;
+
     const CUpti_CallbackData* data = (const CUpti_CallbackData*)cbdata;
-    if (data->callbackSite != CUPTI_API_ENTER) return;
 
-    const char* layer_tag = current_layer_tag();
-    const char* kernel_name = data->functionName ? data->functionName : "unknown";
+    if (data->callbackSite == CUPTI_API_ENTER) {
+        const char* layer_tag = current_layer_tag();
+        const char* kernel_name = data->functionName ? data->functionName : "unknown";
 
-    request_launch_permission(kernel_name, layer_tag);
-    // returning here lets CUPTI/the driver proceed with the real launch
+        request_launch_permission(kernel_name, layer_tag);
+        // returning here lets CUPTI/the driver proceed with the real launch
+        return;
+    }
+
+    if (data->callbackSite == CUPTI_API_EXIT) {
+        // The real kernel has just been submitted to its stream. Extract
+        // the stream and enqueue a host-side callback that fires once this
+        // SPECIFIC kernel has actually finished, so we can decrement the
+        // in-flight count at the right time (not at submission time).
+        //
+        // NOTE: the exact generated struct name for cuLaunchKernel's params
+        // can vary by CUDA/CUPTI version -- verify against your installed
+        // headers (e.g. grep for "cuLaunchKernel_params" under
+        // $CUDA_ROOT/extras/CUPTI/include) if this doesn't compile cleanly.
+        CUstream stream = 0;
+        if (cbid == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel) {
+            typedef struct { CUfunction f; unsigned int gx,gy,gz,bx,by,bz; unsigned int shmem;
+                             CUstream hStream; void** kp; void** extra; } cuLaunchKernel_params_min;
+            stream = ((cuLaunchKernel_params_min*)data->functionParams)->hStream;
+        }
+        if (stream) {
+            cuLaunchHostFunc(stream, launch_completion_callback, NULL);
+        } else {
+            // couldn't determine the stream (e.g. cuLaunchKernelEx, or a
+            // struct-layout mismatch) -- fail safe by decrementing
+            // immediately rather than leaking an inflight count forever.
+            fprintf(stderr, "[agent pid=%d] WARNING: couldn't resolve stream for "
+                            "completion tracking, decrementing immediately\n", getpid());
+            launch_completion_callback(NULL);
+        }
+    }
 }
 
 /* ======================================================================

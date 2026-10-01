@@ -49,6 +49,7 @@ typedef struct {
 
 typedef struct {
     _Atomic int initialized;   // set by the daemon once setup is complete
+    _Atomic int gpu_inflight_count; // 0 == nothing currently executing (see scheduler_daemon.c)
 
     pthread_mutex_t mutex;          // guards slots[] and regions[]/region_count
     sem_t           new_request_sem; // daemon's arbitration loop wakes on this
