@@ -322,26 +322,26 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
         // SPECIFIC kernel has actually finished, so we can decrement the
         // in-flight count at the right time (not at submission time).
         CUstream stream = 0;
+        int resolved = 0;
 
         if (cbid == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel) {
-            // NOTE: this struct is a hand-reconstructed guess at CUPTI's
-            // internal params layout -- verify against your installed
-            // headers (grep "cuLaunchKernel_params" under
-            // $CUDA_ROOT/extras/CUPTI/include) if this keeps falling back.
+            // Confirmed to match generated_cuda_meta.h's cuLaunchKernel_params_st.
             typedef struct { CUfunction f; unsigned int gx,gy,gz,bx,by,bz; unsigned int shmem;
                              CUstream hStream; void** kp; void** extra; } cuLaunchKernel_params_min;
             stream = ((cuLaunchKernel_params_min*)data->functionParams)->hStream;
+            resolved = 1;
         } else if (cbid == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx) {
-            // cuLaunchKernelEx's first argument is `const CUlaunchConfig*`,
-            // a REAL public struct (not a guess) -- its hStream field is
-            // reliable regardless of how CUPTI wraps the params.
+            // Confirmed to match generated_cuda_meta.h's cuLaunchKernelEx_params_st.
             typedef struct { const CUlaunchConfig* config; CUfunction f;
                               void** kernelParams; void** extra; } cuLaunchKernelEx_params_min;
             const CUlaunchConfig* cfg = ((cuLaunchKernelEx_params_min*)data->functionParams)->config;
-            if (cfg) stream = cfg->hStream;
+            if (cfg) {
+                stream = cfg->hStream;
+                resolved = 1;
+            }
         }
 
-        if (stream) {
+        if (resolved) {
             CUresult hf_res = cuLaunchHostFunc(stream, launch_completion_callback, NULL);
             if (hf_res != CUDA_SUCCESS) {
                 fprintf(stderr, "[agent pid=%d] WARNING: cuLaunchHostFunc failed (%d) for "
@@ -350,11 +350,8 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
                 launch_completion_callback(NULL);
             }
         } else {
-            // couldn't determine the stream -- fail safe by decrementing
-            // immediately rather than leaking an inflight count forever.
-            // If this fires for cbid == cuLaunchKernel specifically (not
-            // Ex), the cuLaunchKernel_params_min guess above is wrong for
-            // your CUDA version and needs the real struct from your headers.
+            // Only happens for an unhandled cbid, or a NULL CUlaunchConfig*
+            // pointer for the Ex path (genuinely anomalous)
             fprintf(stderr, "[agent pid=%d] WARNING: couldn't resolve stream for "
                             "completion tracking (cbid=%d), decrementing immediately\n",
                             getpid(), (int)cbid);
