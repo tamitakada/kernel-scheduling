@@ -25,20 +25,17 @@ int main() {
     const int NUM_KERNELS = 5;
     const int SLEEP_MS = 2000;
 
-    cudaStream_t streams[NUM_KERNELS];
-    for (int i = 0; i < NUM_KERNELS; ++i) {
-        CUDA_CHECK(cudaStreamCreate(&streams[i]));
-    }
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&streams));
 
-    // Launch 3 sleep kernels, each in its own stream so they can overlap.
     for (int i = 0; i < NUM_KERNELS; ++i) {
-        sleep_kernel<<<1, 1, 0, streams[i]>>>(i, SLEEP_MS);
+        sleep_kernel<<<1, 1, 0, stream>>>(i, SLEEP_MS);
+        printf("Kernel %d queued for exec...\n", i);
         CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
     
-    for (int i = 0; i < NUM_KERNELS; ++i) 
-        CUDA_CHECK(cudaStreamDestroy(streams[i]));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamDestroy(stream));
     
     return 0;
 }
