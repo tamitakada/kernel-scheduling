@@ -321,35 +321,43 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
         // the stream and enqueue a host-side callback that fires once this
         // SPECIFIC kernel has actually finished, so we can decrement the
         // in-flight count at the right time (not at submission time).
-        //
-        // NOTE: the exact generated struct name for cuLaunchKernel's params
-        // can vary by CUDA/CUPTI version -- verify against your installed
-        // headers (e.g. grep for "cuLaunchKernel_params" under
-        // $CUDA_ROOT/extras/CUPTI/include) if this doesn't compile cleanly.
         CUstream stream = 0;
+
         if (cbid == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel) {
+            // NOTE: this struct is a hand-reconstructed guess at CUPTI's
+            // internal params layout -- verify against your installed
+            // headers (grep "cuLaunchKernel_params" under
+            // $CUDA_ROOT/extras/CUPTI/include) if this keeps falling back.
             typedef struct { CUfunction f; unsigned int gx,gy,gz,bx,by,bz; unsigned int shmem;
                              CUstream hStream; void** kp; void** extra; } cuLaunchKernel_params_min;
             stream = ((cuLaunchKernel_params_min*)data->functionParams)->hStream;
+        } else if (cbid == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx) {
+            // cuLaunchKernelEx's first argument is `const CUlaunchConfig*`,
+            // a REAL public struct (not a guess) -- its hStream field is
+            // reliable regardless of how CUPTI wraps the params.
+            typedef struct { const CUlaunchConfig* config; CUfunction f;
+                              void** kernelParams; void** extra; } cuLaunchKernelEx_params_min;
+            const CUlaunchConfig* cfg = ((cuLaunchKernelEx_params_min*)data->functionParams)->config;
+            if (cfg) stream = cfg->hStream;
         }
+
         if (stream) {
             CUresult hf_res = cuLaunchHostFunc(stream, launch_completion_callback, NULL);
             if (hf_res != CUDA_SUCCESS) {
-                // This is the likely cause of a permanent hang: if the stream
-                // we extracted was garbage (struct-layout mismatch) and this
-                // call failed silently, gpu_inflight_count would never drop
-                // back to zero and every subsequent kernel would be gated
-                // forever. Fail safe instead.
                 fprintf(stderr, "[agent pid=%d] WARNING: cuLaunchHostFunc failed (%d) for "
-                                "stream=%p, decrementing immediately\n", getpid(), hf_res, (void*)stream);
+                                "stream=%p cbid=%d, decrementing immediately\n",
+                                getpid(), hf_res, (void*)stream, (int)cbid);
                 launch_completion_callback(NULL);
             }
         } else {
-            // couldn't determine the stream (e.g. cuLaunchKernelEx, or a
-            // struct-layout mismatch) -- fail safe by decrementing
+            // couldn't determine the stream -- fail safe by decrementing
             // immediately rather than leaking an inflight count forever.
+            // If this fires for cbid == cuLaunchKernel specifically (not
+            // Ex), the cuLaunchKernel_params_min guess above is wrong for
+            // your CUDA version and needs the real struct from your headers.
             fprintf(stderr, "[agent pid=%d] WARNING: couldn't resolve stream for "
-                            "completion tracking, decrementing immediately\n", getpid());
+                            "completion tracking (cbid=%d), decrementing immediately\n",
+                            getpid(), (int)cbid);
             launch_completion_callback(NULL);
         }
     }
