@@ -333,7 +333,17 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
             stream = ((cuLaunchKernel_params_min*)data->functionParams)->hStream;
         }
         if (stream) {
-            cuLaunchHostFunc(stream, launch_completion_callback, NULL);
+            CUresult hf_res = cuLaunchHostFunc(stream, launch_completion_callback, NULL);
+            if (hf_res != CUDA_SUCCESS) {
+                // This is the likely cause of a permanent hang: if the stream
+                // we extracted was garbage (struct-layout mismatch) and this
+                // call failed silently, gpu_inflight_count would never drop
+                // back to zero and every subsequent kernel would be gated
+                // forever. Fail safe instead.
+                fprintf(stderr, "[agent pid=%d] WARNING: cuLaunchHostFunc failed (%d) for "
+                                "stream=%p, decrementing immediately\n", getpid(), hf_res, (void*)stream);
+                launch_completion_callback(NULL);
+            }
         } else {
             // couldn't determine the stream (e.g. cuLaunchKernelEx, or a
             // struct-layout mismatch) -- fail safe by decrementing
