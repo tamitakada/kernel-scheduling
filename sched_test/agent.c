@@ -313,6 +313,9 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
 
         request_launch_permission(kernel_name, layer_tag);
         // returning here lets CUPTI/the driver proceed with the real launch
+
+        fprintf(stderr, "START kernel\n");
+
         return;
     }
 
@@ -342,6 +345,8 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
         }
 
         if (resolved) {
+            fprintf(stderr, "END kernel\n");
+
             CUresult hf_res = cuLaunchHostFunc(stream, launch_completion_callback, NULL);
             if (hf_res != CUDA_SUCCESS) {
                 fprintf(stderr, "[agent pid=%d] WARNING: cuLaunchHostFunc failed (%d) for "
