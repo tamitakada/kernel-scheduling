@@ -1,27 +1,3 @@
-// agent.c
-//
-// LD_PRELOAD this into each vLLM process. Intercepts kernel launches via
-// CUPTI, registers each one into a queue in shared memory owned by a
-// SEPARATE scheduler_daemon process, blocks until that daemon releases this
-// specific launch, and -- if the daemon attached a prefetch instruction --
-// executes the prefetch kernel locally (necessarily: only this process's
-// own context can validly touch its own weight memory; see shared_state.h).
-//
-// This file never creates the shared-memory segment -- it only opens one
-// that scheduler_daemon already created. Start the daemon first.
-//
-// BUILD:
-//   CUDA_ROOT=/path/to/cuda
-//   gcc -shared -fPIC -std=gnu11 -o agent.so agent.c \
-//       -I$CUDA_ROOT/include -I$CUDA_ROOT/extras/CUPTI/include \
-//       -L$CUDA_ROOT/extras/CUPTI/lib64 \
-//       -lcuda -lcupti -lnvrtc -lpthread -lrt -ldl
-//
-// RUN:
-//   ./scheduler_daemon &                       # once, before any vLLM process
-//   LD_PRELOAD=./agent.so python process_a.py &
-//   LD_PRELOAD=./agent.so python process_b.py &
-
 #define _GNU_SOURCE
 #include "shared_state.h"
 #include <cuda.h>
@@ -272,6 +248,7 @@ static void request_launch_permission(const char* kernel_name, const char* layer
     g_state->slots[slot].active = 1;
     g_state->slots[slot].ready = 0;
     g_state->slots[slot].has_prefetch = 0;
+    g_state->slots[slot].log_id = 0;
     pthread_mutex_unlock(&g_state->mutex);
 
     sem_post(&g_state->new_request_sem);   // wake the daemon
@@ -314,7 +291,7 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
         request_launch_permission(kernel_name, layer_tag);
         // returning here lets CUPTI/the driver proceed with the real launch
 
-        fprintf(stderr, "START kernel\n");
+        // fprintf(stderr, "START kernel\n");
 
         return;
     }
@@ -345,7 +322,7 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
         }
 
         if (resolved) {
-            fprintf(stderr, "END kernel\n");
+            // fprintf(stderr, "END kernel\n");
 
             CUresult hf_res = cuLaunchHostFunc(stream, launch_completion_callback, NULL);
             if (hf_res != CUDA_SUCCESS) {

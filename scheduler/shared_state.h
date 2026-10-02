@@ -27,6 +27,8 @@ typedef struct {
     int    active;       // slot in use
     int    ready;        // daemon sets this to release the waiting agent
 
+    int    log_id;
+
     // Filled in by the DAEMON before it sets ready=1. The releasing agent
     // reads this and -- because only its own process can validly touch its
     // own weight memory -- executes the actual prefetch launch itself.
