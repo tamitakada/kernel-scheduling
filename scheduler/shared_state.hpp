@@ -10,7 +10,7 @@
 constexpr const char* SHM_NAME = "/kernel_sched_shm_v4";
 constexpr int MAX_PENDING  = 256;
 constexpr int MAX_INFLIGHT = 64;  // max kernels tracked as "currently executing" at once
-constexpr int MAX_REGIONS  = 256;
+constexpr int MAX_REGIONS  = 1024;
 constexpr int NAME_LEN     = 128;
 
 struct PendingSlot {
@@ -20,10 +20,12 @@ struct PendingSlot {
     int   priority;   // filled in by the daemon's policy
     int   active;     // slot in use (request/response queue lifecycle)
     int   ready;      // daemon sets this to release the waiting agent
+    int   kernel_id;
 
     // Filled in by the DAEMON before it sets ready=1.
     int  has_prefetch;
     char prefetch_tag[NAME_LEN];
+    size_t prefetch_max_bytes;
 
     // Index into SchedulerSharedState::inflight[] that the daemon reserved
     // for THIS kernel at release time, or -1. The agent reads this after

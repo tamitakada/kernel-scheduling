@@ -1,14 +1,16 @@
 agent:
-	gcc -shared -fPIC -o agent.so agent.c -lcupti -lcuda -lpthread -lrt \
-		-I$$CUDA_ROOT/include -I$$CUDA_ROOT/extras/CUPTI/include -L$$CUDA_ROOT/extras/CUPTI/lib64
+	g++ -std=c++20 -shared -fPIC -o agent.so agent.cpp \
+		-I$$CUDA_ROOT/include -L$$CUDA_ROOT/lib64 \
+		-lcuda -lcupti -lnvrtc -lpthread -lrt -ldl
 
-test:
+simple:
 	nvcc -arch=native -o simple simple.cu
 
 sched:
-	gcc -o scheduler_daemon scheduler_logging.c scheduler_daemon.c -lpthread -lrt
+	g++ -std=c++20 -o scheduler_daemon scheduler_daemon.cpp -lpthread -lrt
 
 clean-sched:
+	rm -f /dev/shm/kernel_sched_shm_v4
 	rm scheduler_daemon 
 	
 clean-simple:
@@ -17,4 +19,4 @@ clean-simple:
 clean-agent:
 	rm agent.so
 
-clean: clean-sched clean-simple clean-agent
+clean: clean-sched clean-agent clean-simple
