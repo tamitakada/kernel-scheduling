@@ -1,14 +1,18 @@
 #define _GNU_SOURCE
+#define ENABLE_LOGGING 1
+
 #include "shared_state.hpp"
+
 #include <cuda.h>
 #include <cupti.h>
 #include <nvrtc.h>
-#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include <atomic>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -22,42 +26,52 @@
 static SchedulerSharedState* g_state = nullptr;
 static int kernel_count = 0;
 
+// True once this agent has subscribed to CUPTI, i.e. launches go through the scheduler and the SCHEDULER decides
+// whether each one gets a prefetch. The Python-hook entry points (sched_prefetch*) are refused while this is set.
+static std::atomic<bool> g_cupti_active{false};
+
+/* Called from Python program to  
+*/
 extern "C" void register_weight_region(const char* tag, void* ptr, size_t nbytes) {
     pthread_mutex_lock(&g_state->mutex);
-    if (g_state->region_count < MAX_REGIONS) {
-        int i = g_state->region_count++;
-        g_state->regions[i].owner_pid = getpid();
-        std::strncpy(g_state->regions[i].tag, tag, NAME_LEN - 1);
-        g_state->regions[i].ptr = ptr;
-        g_state->regions[i].nbytes = nbytes;
-        g_state->regions[i].active = 1;
-        std::fprintf(stderr, "[agent pid=%d] registered region tag=%s ptr=%p size=%zu\n",
-                getpid(), tag, ptr, nbytes);
-    } else {
-        std::fprintf(stderr, "[agent pid=%d] WARNING: region table full, dropped tag=%s\n",
-                getpid(), tag);
+
+    if (g_state->region_count == MAX_REGIONS) {
+        if (ENABLE_LOGGING)
+            std::fprintf(stderr, "[agent pid=%d] WARNING: region table full at tag=%s\n", getpid(), tag);
+        pthread_mutex_unlock(&g_state->mutex);
+        return;
     }
+   
+    int i = g_state->region_count++;
+    
+    g_state->regions[i].owner_pid = getpid();
+    std::strncpy(g_state->regions[i].tag, tag, NAME_LEN - 1);
+    g_state->regions[i].ptr = ptr;
+    g_state->regions[i].nbytes = nbytes;
+    g_state->regions[i].active = 1;
+
+    if (ENABLE_LOGGING)
+        std::fprintf(stderr, "[agent pid=%d] registered region tag=%s ptr=%p size=%zu\n", getpid(), tag, ptr, nbytes);
+
     pthread_mutex_unlock(&g_state->mutex);
 }
 
 constexpr int MAX_NVTX_STACK = 32;
-thread_local char t_nvtx_stack[MAX_NVTX_STACK][NAME_LEN];
-thread_local int  t_nvtx_depth = 0;
 
+// The tag stack: front() is the innermost module currently running. Every push (= one module entry) gets a unique id,
+// kept in a parallel stack, so the launch path can tell "another kernel of the module entry I already prefetched for"
+// from "a new entry of the same module".
+thread_local std::deque<std::string> t_tag_stack;
+thread_local std::deque<uint64_t>    t_tag_entry;
+thread_local uint64_t                t_tag_next_entry = 0;
 extern "C" void sched_push_tag(const char* name) {
-    if (t_nvtx_depth < MAX_NVTX_STACK) {
-        std::strncpy(t_nvtx_stack[t_nvtx_depth], name, NAME_LEN - 1);
-        t_nvtx_stack[t_nvtx_depth][NAME_LEN - 1] = '\0';
-        t_nvtx_depth++;
-    }
+    t_tag_stack.push_front(name);
+    t_tag_entry.push_front(++t_tag_next_entry);
 }
-
 extern "C" void sched_pop_tag() {
-    if (t_nvtx_depth > 0) t_nvtx_depth--;
-}
-
-static const char* current_layer_tag() {
-    return t_nvtx_depth > 0 ? t_nvtx_stack[t_nvtx_depth - 1] : "unknown";
+    if (t_tag_stack.empty()) return;                 // an unbalanced pop must not be undefined behaviour
+    t_tag_stack.pop_front();
+    t_tag_entry.pop_front();
 }
 
 // Set while WE are launching a kernel of our own (prefetch) through the
@@ -269,6 +283,10 @@ static void refresh_own_regions_locked() {
 constexpr size_t PREFETCH_UNIT = 16;   // the prefetch kernel reads whole float4 (16-byte) units
 
 static std::atomic<long> g_pf_kernels{0}, g_pf_skipped{0}, g_pf_args_hit{0}, g_pf_args_other{0}, g_pf_args_none{0};
+// CUPTI path only: launches the scheduler told us NOT to prefetch for, and launches skipped because their module entry
+// had already been prefetched (a module that launches several kernels is prefetched once, on the first one).
+static std::atomic<long> g_pf_denied{0}, g_pf_dup{0};
+thread_local uint64_t t_last_prefetch_entry = 0;
 static std::atomic<long long> g_pf_bytes_total{0};
 
 struct PrefetchSeg { uintptr_t ptr; size_t nbytes; std::string tag; };
@@ -286,7 +304,7 @@ struct PrefetchSettings { bool enabled; size_t max_bytes; size_t min_bytes; };
 
 static const PrefetchSettings& prefetch_settings() {
     static const PrefetchSettings cfg = [] {
-        PrefetchSettings v{true, 10ull * 1024 * 1024, 64ull * 1024};
+        PrefetchSettings v{true, 20ull * 1024 * 1024, 0};
         if (const char* e = std::getenv("SCHED_PREFETCH")) v.enabled = std::atoi(e) != 0;
         if (const char* e = std::getenv("SCHED_PREFETCH_MAX_MB")) {
             double mb = std::atof(e);
@@ -500,9 +518,10 @@ static void timing_mark_end(CUstream stream) {
 // Blocks until every recorded kernel has finished, then appends rows to
 // <SCHED_LOG_DIR or .>/agent_<pid>_timing.tsv (sort by kernel_id to match your log).
 extern "C" void sched_flush_timing() {
-    std::fprintf(stderr, "[agent pid=%d] prefetch: kernels_prefetched=%ld kernels_skipped=%ld args_hit=%ld args_other=%ld args_none=%ld prefetched_bytes_total=%lld\n",
-                 getpid(), g_pf_kernels.load(), g_pf_skipped.load(), g_pf_args_hit.load(),
-                 g_pf_args_other.load(), g_pf_args_none.load(), g_pf_bytes_total.load());
+    std::fprintf(stderr, "[agent pid=%d] prefetch: kernels_prefetched=%ld kernels_skipped=%ld scheduler_denied=%ld "
+                         "same_module_entry=%ld args_hit=%ld args_other=%ld args_none=%ld prefetched_bytes_total=%lld\n",
+                 getpid(), g_pf_kernels.load(), g_pf_skipped.load(), g_pf_denied.load(), g_pf_dup.load(),
+                 g_pf_args_hit.load(), g_pf_args_other.load(), g_pf_args_none.load(), g_pf_bytes_total.load());
 
     // A ctypes call may run on a thread with no current CUDA context.
     CUcontext cur = nullptr;
@@ -609,6 +628,82 @@ static void inject_prefetch(const PrefetchPlan& plan, bool have_stream, CUstream
 }
 
 /* ======================================================================
+ * HOOK-TRIGGERED PREFETCH (no CUPTI)
+ *
+ * For running under Nsight Compute: ncu and this agent cannot both own CUPTI,
+ * so with SCHED_NO_CUPTI=1 the agent does not subscribe and nothing here
+ * intercepts launches. Instead a Python forward pre-hook calls
+ * sched_prefetch() just before the module that should run with warm weights.
+ * (Same policy and injection as the CUPTI path; stream = -1 means unknown.)
+ * ====================================================================== */
+
+static std::atomic<long> g_hook_calls{0}, g_hook_empty{0};
+
+// With CUPTI active the scheduler owns the prefetch decision, so a Python hook must not prefetch behind its back.
+static bool hook_prefetch_blocked() {
+    if (!g_cupti_active.load()) return false;
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+        std::fprintf(stderr, "[agent pid=%d] WARNING: sched_prefetch*() called while the CUPTI path is active; ignored "
+                             "(the scheduler decides, and the tag hooks drive the prefetch). Use SCHED_NO_CUPTI=1 for "
+                             "hook-triggered prefetch.\n", getpid());
+    return true;
+}
+
+extern "C" long long sched_prefetch(const char* hook_tag, long long stream) {
+    if (!hook_tag) return -1;
+    if (hook_prefetch_blocked()) return 0;
+    PrefetchPlan plan;
+    select_prefetch_targets(hook_tag, &plan);
+    const long n = g_hook_calls++;
+    if (plan.segs.empty()) { g_hook_empty++; return 0; }
+
+    g_pf_kernels++;
+    t_timing_slot = -1;                       // no CUDA-event timing in this mode
+    inject_prefetch(plan, stream >= 0, reinterpret_cast<CUstream>(static_cast<intptr_t>(stream)));
+    if (n < 5)
+        std::fprintf(stderr, "[agent pid=%d] sched_prefetch(%s, stream=%lld): %zu tensor(s), %zu bytes\n",
+                     getpid(), hook_tag, stream, plan.segs.size(), plan.total_bytes);
+    return static_cast<long long>(plan.total_bytes);
+}
+
+extern "C" long long sched_prefetch_ranges(const unsigned long long* ptrs, const unsigned long long* sizes,
+                                           int n, long long stream) {
+    if (!ptrs || !sizes || n <= 0) return -1;
+    if (hook_prefetch_blocked()) return 0;
+    const PrefetchSettings& cfg = prefetch_settings();
+    const long call = g_hook_calls++;
+    if (!cfg.enabled) { g_hook_empty++; return 0; }
+
+    PrefetchPlan plan;
+    size_t remaining = cfg.max_bytes;
+    for (int i = 0; i < n && remaining > 0; i++) {
+        uintptr_t lo = static_cast<uintptr_t>(ptrs[i]);
+        size_t size = static_cast<size_t>(sizes[i]);
+        if (lo == 0 || size < cfg.min_bytes) continue;
+        const size_t skip = (PREFETCH_UNIT - lo % PREFETCH_UNIT) % PREFETCH_UNIT;   // float4 loads need 16-byte alignment
+        if (size <= skip) continue;
+        lo += skip;
+        size -= skip;
+        size_t take = std::min(size, remaining);                  // the hard cap, shared by all ranges of one call
+        take -= take % PREFETCH_UNIT;
+        if (take == 0) continue;
+        plan.segs.push_back({lo, take, std::string()});
+        plan.total_bytes += take;
+        remaining -= take;
+    }
+    if (plan.segs.empty()) { g_hook_empty++; return 0; }
+
+    g_pf_kernels++;
+    t_timing_slot = -1;
+    inject_prefetch(plan, stream >= 0, reinterpret_cast<CUstream>(static_cast<intptr_t>(stream)));
+    if (call < 5)
+        std::fprintf(stderr, "[agent pid=%d] sched_prefetch_ranges: %d range(s) given, %zu prefetched, %zu bytes, stream=%lld\n",
+                     getpid(), n, plan.segs.size(), plan.total_bytes, stream);
+    return static_cast<long long>(plan.total_bytes);
+}
+
+/* ======================================================================
  * CLIENT SIDE OF THE QUEUE: register this launch with the daemon, block
  * until released, record the inflight slot the daemon reserved for us, and
  * execute any prefetch instruction it attached.
@@ -616,7 +711,7 @@ static void inject_prefetch(const PrefetchPlan& plan, bool have_stream, CUstream
 
 static void request_launch_permission(const char* kernel_name, const char* layer_tag,
                                       bool have_stream, CUstream app_stream,
-                                      const LaunchArgs& args) {
+                                      const LaunchArgs& args, uint64_t entry_seq) {
     t_timing_slot = -1;   // no timing for this launch unless a slot is acquired below
     pthread_mutex_lock(&g_state->mutex);
     int slot = -1;
@@ -642,6 +737,7 @@ static void request_launch_permission(const char* kernel_name, const char* layer
     g_state->slots[slot].ready = 0;
     g_state->slots[slot].inflight_slot = -1;
     g_state->slots[slot].kernel_id = 0;
+    g_state->slots[slot].do_prefetch = -1;   // the daemon fills in 1 (prefetch) or 0 (don't) before it releases us
     pthread_mutex_unlock(&g_state->mutex);
 
     sem_post(&g_state->new_request_sem);     // wake the daemon
@@ -649,21 +745,41 @@ static void request_launch_permission(const char* kernel_name, const char* layer
 
     pthread_mutex_lock(&g_state->mutex);
     t_current_inflight_slot = g_state->slots[slot].inflight_slot; // carry through to EXIT
+    int do_prefetch = g_state->slots[slot].do_prefetch;           // the scheduler's decision; copy it BEFORE the slot is recycled
     g_state->slots[slot].active = 0;
     pthread_mutex_unlock(&g_state->mutex);
 
-    // Prefetch decision, made entirely on the agent side from the kernel's
-    // forward-hook tag (see the policy block above): the tensors owned by the
-    // module this kernel runs in, capped. An empty plan means skip.
+    // WHETHER to prefetch is the scheduler's decision: do_prefetch, written by the daemon before it released us
+    // (1 = prefetch, 0 = don't). WHAT to prefetch stays agent-side: the tensors owned by the module this kernel runs
+    // in, found from its forward-hook tag (see the policy block above) and capped. A module entry is prefetched at most
+    // once, on the first kernel the scheduler allows, however many kernels the module launches (a GEMM and its split-K
+    // reduce, say) -- the same once-per-module-call behaviour as the hook-triggered path.
+    if (do_prefetch != 0 && do_prefetch != 1) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "[agent pid=%d] WARNING: the daemon released a kernel without setting do_prefetch "
+                                 "(got %d): is the daemon binary or /dev/shm segment from an older build? "
+                                 "Treating it as 'do not prefetch'.\n", getpid(), do_prefetch);
+        do_prefetch = 0;
+    }
     PrefetchPlan plan;
-    select_prefetch_targets(layer_tag, &plan);
+    bool selection_ran = false;
+    if (do_prefetch == 0) {
+        g_pf_denied++;
+    } else if (entry_seq != 0 && entry_seq == t_last_prefetch_entry) {
+        g_pf_dup++;
+    } else {
+        select_prefetch_targets(layer_tag, &plan);
+        selection_ran = true;
+    }
 
     std::string args_check = "-";
     std::string prefetched_tensors;
     if (plan.segs.empty()) {
-        g_pf_skipped++;
+        if (selection_ran) g_pf_skipped++;            // allowed, but this kernel's module owns nothing worth prefetching
     } else {
         g_pf_kernels++;
+        t_last_prefetch_entry = entry_seq;
         args_check = check_args_advisory(args, plan);          // advisory only: never gates the prefetch
         if (args_check == "HIT") g_pf_args_hit++;
         else if (args_check == "NONE") g_pf_args_none++;
@@ -710,7 +826,8 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
     const CUpti_CallbackData* data = static_cast<const CUpti_CallbackData*>(cbdata);
 
     if (data->callbackSite == CUPTI_API_ENTER) { // on kernel launch
-        const char* layer_tag = current_layer_tag();
+        const char* layer_tag = t_tag_stack.empty() ? "unknown" : t_tag_stack.front().c_str();
+        const uint64_t entry_seq = t_tag_entry.empty() ? 0 : t_tag_entry.front();   // which entry of that module this is
         const char* kernel_name = (data->symbolName && data->symbolName[0]) ? data->symbolName : "unknown";
         // Find the app's stream so inject_prefetch can make it wait on the
         // prefetch before the real kernel is queued onto it.
@@ -719,7 +836,7 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
         LaunchArgs args;
         launch_args(cbid, data->functionParams, &args);
 
-        request_launch_permission(kernel_name, layer_tag, have_stream, app_stream, args);
+        request_launch_permission(kernel_name, layer_tag, have_stream, app_stream, args, entry_seq);
         // returning here lets CUPTI/the driver proceed with the real launch
         return;
     }
@@ -775,6 +892,14 @@ static void agent_init() {
     // load the shared memory state thru which agent communicates with scheduler
     open_shared_state();
 
+    // SCHED_NO_CUPTI=1: leave CUPTI alone (so Nsight Compute can use it) and do not intercept launches. The weight
+    // registry and sched_prefetch() still work; prefetches then come from Python hooks, not from the launch callback.
+    if (const char* e = std::getenv("SCHED_NO_CUPTI"); e && std::atoi(e) != 0) {
+        std::fprintf(stderr, "[agent pid=%d] SCHED_NO_CUPTI=1: NOT subscribing to CUPTI; launches are not intercepted, "
+                             "prefetch is triggered by sched_prefetch() calls\n", getpid());
+        return;
+    }
+
     CUptiResult res = cuptiSubscribe(&g_subscriber, (CUpti_CallbackFunc)cupti_callback, nullptr);
     if (res != CUPTI_SUCCESS) {
         std::fprintf(stderr, "[agent pid=%d] FATAL: cuptiSubscribe failed: %d\n", getpid(), res);
@@ -784,5 +909,6 @@ static void agent_init() {
     // intercept CUDA kernel launches
     cuptiEnableCallback(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel);
     cuptiEnableCallback(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx);
+    g_cupti_active.store(true);
     std::fprintf(stderr, "[agent pid=%d] CUPTI subscriber attached\n", getpid());
 }

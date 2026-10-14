@@ -1,5 +1,4 @@
 #include "shared_state.hpp"
-#include "scheduler_logger.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -25,17 +24,25 @@ static int policy_compute_priority(const char* kernel_name, const char* layer_ta
     return 0; // placeholder: FIFO across all attached processes
 }
 
+// Whether the agent should prefetch for this kernel launch (1) or not (0). Written into the kernel's slot before it is
+// released; the agent does what it says. Placeholder policy: always prefetch.
+static int policy_should_prefetch(const char* kernel_name, const char* layer_tag) {
+    (void)kernel_name;
+    (void)layer_tag;
+    return 0;
+}
+
 /* ======================================================================
  * INFLIGHT TRACKING -- per-kernel slots, not a single counter. Caller must
  * already hold state->mutex for both of these.
  * ====================================================================== */
 
-static bool any_inflight_locked(std::map<int,int>& kernel_id_to_slot_idx, SchedulerLogger& logger) {
+static bool any_inflight_locked(std::map<int,int>& kernel_id_to_slot_idx) {
     std::vector<int> finished_ids;
     bool any_active = false;
     for (const auto& [kid, sidx] : kernel_id_to_slot_idx) {
         if (state->inflight[sidx].active.load() == 0) {
-            logger.log_kernel_exec_end(kid);
+            //logger.log_kernel_exec_end(kid);
             finished_ids.push_back(kid);
         }
         else any_active = true;
@@ -87,6 +94,7 @@ static void init_shared_state() {
         sem_init(&state->slots[i].wake_sem, /*pshared=*/1, 0);
         state->slots[i].active = 0;
         state->slots[i].inflight_slot = -1;
+        state->slots[i].do_prefetch = -1;
     }
     for (int i = 0; i < MAX_INFLIGHT; i++) {
         state->inflight[i].active.store(0);
@@ -112,7 +120,7 @@ int main() {
 
     init_shared_state();
 
-    SchedulerLogger logger;
+    //SchedulerLogger logger;
     int arrived_kernel_count = 0;
 
     std::map<int, int> kernel_id_to_slot_idx;
@@ -135,7 +143,7 @@ int main() {
                 if (!state->slots[i].kernel_id) { // log arrival if first time
                     arrived_kernel_count++;
                     state->slots[i].kernel_id = arrived_kernel_count;
-                    logger.log_kernel_arrival(state->slots[i].kernel_id, state->slots[i].kernel_name, n_pending);
+                    // logger.log_kernel_arrival(state->slots[i].kernel_id, state->slots[i].kernel_name, n_pending);
                 }
 
                 state->slots[i].priority = policy_compute_priority(
@@ -146,7 +154,7 @@ int main() {
             }
         }
 
-        if (best != -1 && any_inflight_locked(kernel_id_to_slot_idx, logger)) {
+        if (best != -1 && any_inflight_locked(kernel_id_to_slot_idx)) {
             best = -1; // GPU busy -- leave this candidate pending, try again later
         }
 
@@ -159,15 +167,18 @@ int main() {
                 best = -1;
             } else {
                 kernel_id_to_slot_idx[state->slots[best].kernel_id] = slot_idx;
-                logger.log_kernel_exec_start(state->slots[best].kernel_id, 1);
+                // logger.log_kernel_exec_start(state->slots[best].kernel_id, 1);
 
                 state->slots[best].inflight_slot = slot_idx;
 
+                state->slots[best].do_prefetch = policy_should_prefetch(
+                    state->slots[best].kernel_name, state->slots[best].layer_tag);
+
                 std::fprintf(stderr,
-                    "[daemon] release pid=%d kernel=%s layer=%s inflight_slot=%d\n",
+                    "[daemon] release pid=%d kernel=%s layer=%s inflight_slot=%d prefetch=%d\n",
                     state->slots[best].pid, state->slots[best].kernel_name,
                     state->slots[best].layer_tag,
-                    slot_idx);
+                    slot_idx, state->slots[best].do_prefetch);
                 state->slots[best].ready = 1;
             }
         }

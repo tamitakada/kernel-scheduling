@@ -27,6 +27,8 @@ struct PendingSlot {
     char prefetch_tag[NAME_LEN];
     size_t prefetch_max_bytes;
 
+    int do_prefetch;
+
     // Index into SchedulerSharedState::inflight[] that the daemon reserved
     // for THIS kernel at release time, or -1. The agent reads this after
     // being released and carries it through to the kernel's actual GPU

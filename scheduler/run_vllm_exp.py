@@ -13,8 +13,6 @@ os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 from vllm import LLM, SamplingParams
 
 
-# "HuggingFaceTB/SmolLM2-135M-Instruct"
-
 agent = ctypes.CDLL("./agent.so")
 agent.register_weight_region.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
 agent.register_weight_region.restype = None
@@ -24,27 +22,25 @@ agent.sched_pop_tag.argtypes = []
 agent.sched_pop_tag.restype = None
 agent.sched_flush_timing.argtypes = []
 agent.sched_flush_timing.restype = None
+agent.sched_prefetch.argtypes = [ctypes.c_char_p, ctypes.c_longlong]
+agent.sched_prefetch.restype = ctypes.c_longlong
+agent.sched_prefetch_ranges.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+                                        ctypes.c_int, ctypes.c_longlong]
+agent.sched_prefetch_ranges.restype = ctypes.c_longlong
 
-def _make_push(name):
-    b = name.encode()
-    def hook(module, args):
-        agent.sched_push_tag(b)
-    return hook
 
-def _pop(module, args, output):
-    agent.sched_pop_tag()
+def _env_flag(name):
+    v = os.environ.get(name, "")
+    return v not in ("", "0")
 
-def _find_layers(model):
-    """The list of decoder layers: model.model.layers for Llama/Qwen-style
-    models, else the first module list named '...layers'."""
-    inner = getattr(model, "model", None)
-    layers = getattr(inner, "layers", None)
-    if layers is not None:
-        return list(layers)
-    for name, mod in model.named_modules():
-        if name.split(".")[-1] == "layers" and hasattr(mod, "__len__"):
-            return list(mod)
-    raise RuntimeError("could not find the decoder layers; print(model) and adjust _find_layers")
+
+def _find_layers(model) -> list:
+    """Returns list of all decoder layers, i.e. model.model.layers for 
+    Llama/Qwen-style models."""
+
+    if model.model.layers is None:
+        raise RuntimeError("Bad model")
+    return model.model.layers
 
 
 def _tag_module(agent, module, tag):
@@ -52,67 +48,101 @@ def _tag_module(agent, module, tag):
     tag_bytes = tag.encode("utf-8")
 
     def pre_hook(mod, args):
-        agent.sched_push_tag(tag_bytes)    # returns None -> inputs left untouched
+        agent.sched_push_tag(tag_bytes)
 
     def post_hook(mod, args, output):
-        agent.sched_pop_tag()              # returns None -> output left untouched
+        agent.sched_pop_tag()
 
     module.register_forward_pre_hook(pre_hook)
     module.register_forward_hook(post_hook)
 
 
-def register_model(model, so_path=None, verbose=True):
-    """Registers every decoder-layer parameter and tags every leaf submodule.
-    Call once, after the weights are on the GPU and in the process that
-    launches the kernels. Returns (tensors registered, modules tagged)."""
+def _param_range(p):
+    if not p.is_cuda or p.numel() == 0:
+        return None
+    span = 1 + sum((s - 1) * st for s, st in zip(p.shape, p.stride()))
+    return p.data_ptr(), span * p.element_size()
+
+
+def register_model(model, should_tag_hooks=None):
+    """Registers every decoder-layer parameter with the agent, then wires up the prefetch for the active mode:
+
+      CUPTI path   (default): tag hooks. Each leaf module pushes/pops a "layer_<i>/<module>" tag; the agent's launch
+                   callback reads it, the SCHEDULER decides per launch whether to prefetch, and the agent prefetches the
+                   tensors registered for that module.
+      SCHED_NO_CUPTI=1:       prefetch pre-hooks. Each module with weights prefetches them itself, right before it runs.
+
+    should_tag_hooks=None picks the mode from SCHED_NO_CUPTI; pass True/False to force one. The two must not be mixed:
+    the agent ignores the pre-hook prefetch while CUPTI is active.
+    Call once, after the weights are on the GPU and in the process that launches the kernels."""
+
+    if should_tag_hooks is None:
+        should_tag_hooks = not _env_flag("SCHED_NO_CUPTI")
+
     layers = _find_layers(model)
 
-    n_tensors = n_modules = 0
     for i, layer in enumerate(layers):
         for name, param in layer.named_parameters():
             tag = f"layer{i}_{name}".replace(".", "_").encode("utf-8")
             nbytes = param.numel() * param.element_size()
-            agent.register_weight_region(tag, ctypes.c_void_p(param.data_ptr()), ctypes.c_size_t(nbytes))
-            n_tensors += 1
+            agent.register_weight_region(
+                tag, 
+                ctypes.c_void_p(param.data_ptr()), 
+                ctypes.c_size_t(nbytes))
 
-        _tag_module(agent, layer, f"layer_{i}")
-        n_modules += 1
-        for name, sub in layer.named_modules():
-            is_leaf = not any(True for _ in sub.children())
-            if name and is_leaf:
-                _tag_module(agent, sub, f"layer_{i}/{name.replace('.', '_')}")
-                n_modules += 1
+        if should_tag_hooks: # register prefetch tags before/after modules
+            # tag the layer then any sublayers
+            _tag_module(agent, layer, f"layer_{i}")
 
-    if verbose:
-        print(f"[scheduler_setup] {len(layers)} layers: registered {n_tensors} tensors, "
-              f"tagged {n_modules} modules")
-        if layers:
-            leaves = [n.replace(".", "_") for n, m in layers[0].named_modules()
-                      if n and not any(True for _ in m.children())]
-            print(f"[scheduler_setup] layer 0 leaf modules tagged: {', '.join(leaves)}")
-    return n_tensors, n_modules
+            # TODO: confirm layer.named_modules() walks ALL nodes in tree
+            for name, sub in layer.named_modules():
+                if name and len(list(sub.children())) == 0:
+                    _tag_module(agent, sub, f"layer_{i}/{name.replace('.', '_')}")
+        
+        else:
+            for name, sub in layer.named_modules():
+                ranges = [r for r in map(_param_range, sub.parameters(recurse=False)) if r]
 
-def run_batch_infer(model_name, prompts, enable_pc=True, so_path="./agent.so"):    
+                n = len(ranges)
+                ptrs = (ctypes.c_uint64 * n)(*(a for a, _ in ranges))
+                sizes = (ctypes.c_uint64 * n)(*(b for _, b in ranges))
+
+                def _sched_prefetch_ranges_hook(m, args, _p=ptrs, _s=sizes, _n=n):
+                    agent.sched_prefetch_ranges(_p, _s, _n, torch.cuda.current_stream().cuda_stream)
+
+                sub.register_forward_pre_hook(_sched_prefetch_ranges_hook)
+
+
+def run_batch_infer(model_name, prompts, enable_pc=False):    
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=2048)
 
-    llm = LLM(model=model_name,
-              enforce_eager=True,
-              enable_prefix_caching=enable_pc) #gpu_memory_utilization=0.5)
+    llm = LLM(
+        model=model_name,
+        enforce_eager=True,
+        enable_prefix_caching=enable_pc,
+        gpu_memory_utilization=0.8
+    )
 
+    print("Loaded llm, begin register...")
+    
     llm.apply_model(register_model)
 
+    print("Finished register, begin warmup...")
+
     warmup_prompts = [[{"role": "user", "content": "Recite the alphabet."}]]
-    _ = llm.chat(warmup_prompts, sampling_params, chat_template_kwargs={
-        "enable_thinking": False})
+    _ = llm.chat(warmup_prompts, sampling_params, chat_template_kwargs={"enable_thinking": False})
     
-    # start = time.time()
-    # torch.cuda.cudart().cudaProfilerStart()
+    print("Finished warmup, begin profiling...")
+
+    torch.cuda.cudart().cudaProfilerStart()
+
     outputs = llm.chat(
         [[{"role": "user", "content": p}] for p in prompts],
         sampling_params,
         chat_template_kwargs={"enable_thinking": False})
-    # torch.cuda.cudart().cudaProfilerStop()
-    # total_time = time.time() - start
+    
+    torch.cuda.cudart().cudaProfilerStop()
+  
     return [o.outputs[0].text for o in outputs]
 
 
@@ -128,13 +158,11 @@ if __name__ == "__main__":
         "I want you to act as an interviewer. I will be the candidate and you will ask me the interview questions for the ${Position:Software Developer} position. I want you to only reply as the interviewer. Do not write all the conversation at once. I want you to only do the interview with me. Ask me the questions and wait for my answers. Do not write explanations. Ask me the questions one by one like an interviewer does and wait for my answers. My first sentence is \"Hi\"",
         "I want you to act as a javascript console. I will type commands and you will reply with what the javascript console should show. I want you to only reply with the terminal output inside one unique code block, and nothing else. do not write explanations. do not type commands unless I instruct you to do so. when i need to tell you something in english, i will do so by putting text inside curly brackets {like this}. my first command is console.log(\"Hello World\");"
     ]
+
+    print(f"Received {model_name}, starting load...")
     
     data = run_batch_infer(model_name, prompts)
     print(data) 
 
     agent.sched_flush_timing.argtypes = []
     agent.sched_flush_timing()
-
-    # with open("responses.txt", "a") as f:
-    #     f.write(f"{data}\n")
-

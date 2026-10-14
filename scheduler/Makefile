@@ -1,6 +1,6 @@
 agent:
 	g++ -std=c++20 -shared -fPIC -o agent.so agent.cpp \
-		-I$$CUDA_ROOT/include -L$$CUDA_ROOT/lib64 \
+		-I$$CUDA_ROOT/include -I$$CUDA_ROOT/extras/CUPTI/include -L$$CUDA_ROOT/lib64 -L$$CUDA_ROOT/extras/CUPTI/lib64 -L$$CUDA_ROOT/targets \
 		-lcuda -lcupti -lnvrtc -lpthread -lrt -ldl
 
 simple:
