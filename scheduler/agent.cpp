@@ -304,7 +304,7 @@ struct PrefetchSettings { bool enabled; size_t max_bytes; size_t min_bytes; };
 
 static const PrefetchSettings& prefetch_settings() {
     static const PrefetchSettings cfg = [] {
-        PrefetchSettings v{true, 20ull * 1024 * 1024, 0};
+        PrefetchSettings v{true, 64ull * 1024 * 1024, 0};
         if (const char* e = std::getenv("SCHED_PREFETCH")) v.enabled = std::atoi(e) != 0;
         if (const char* e = std::getenv("SCHED_PREFETCH_MAX_MB")) {
             double mb = std::atof(e);

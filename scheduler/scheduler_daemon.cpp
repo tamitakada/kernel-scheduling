@@ -29,7 +29,7 @@ static int policy_compute_priority(const char* kernel_name, const char* layer_ta
 static int policy_should_prefetch(const char* kernel_name, const char* layer_tag) {
     (void)kernel_name;
     (void)layer_tag;
-    return 0;
+    return 1;
 }
 
 /* ======================================================================

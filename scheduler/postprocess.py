@@ -11,18 +11,33 @@ if __name__ == "__main__":
 
     df1 = pd.read_csv(f1, sep="\t")
     df2 = pd.read_csv(f2, sep="\t")
+    
+    total_exec_s1 = (df1[df1["hook_tag"] == "unknown"]["kernel_us"].sum() + \
+        df1[df1["hook_tag"] != "unknown"]["kernel_us"].sum() + \
+        df1[df1["hook_tag"] != "unknown"]["prefetch_us"].sum()) / (10**6)
+    total_exec_s2 = df2["kernel_us"].sum() / (10**6)
+    ideal_exec_s1 = df1["kernel_us"].sum() / (10**6)
+    
+    print(f"Real execs: {total_exec_s1}, {total_exec_s2}, diff: {total_exec_s1 - total_exec_s2}")
+    print(f"Ideal exec: {ideal_exec_s1}, diff: {ideal_exec_s1 - total_exec_s2}")
+    print(f"Real TPUT: {5 / total_exec_s1}, {5 / total_exec_s2}, {5 / ideal_exec_s1}")
+    print()
+    
+    df1 = df1[df1["hook_tag"] != "unknown"]
+    
+    df2 = df2[df2["hook_tag"] != "unknown"]
 
     kernel_types = df1["kernel_name"].unique()
     for kt in df1.groupby("kernel_name")["kernel_us"].mean().sort_values().index.tolist():
-        print(kt)
-
-        df11 = df1[df1["kernel_name"]==kt]
+        df11 = df1[(df1["kernel_name"]==kt) & (df1["prefetch_us"] > 0)]
         df21 = df2[df2["kernel_name"]==kt]
-
-        print(df11["kernel_us"].mean() - df21["kernel_us"].mean())
-
-        # mean_qtime_diff = df11["queueing_time"].mean() - df21["queueing_time"].mean()
-        # mean_etime_diff = df11["exec_time"].mean() - df21["exec_time"].mean()
-
-        # print(df11["exec_time"].mean(), mean_qtime_diff, mean_etime_diff)
+        
+        if len(df11) == 0:
+            continue
+        
+        print(kt)
+        print(f"With #: {len(df11)}, Without #: {len(df21)}")
+        print(df21["kernel_us"].mean(), df11["kernel_us"].mean() - df21["kernel_us"].mean())
         print()
+        
+    print()

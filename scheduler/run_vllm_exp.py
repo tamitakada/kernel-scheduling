@@ -1,11 +1,8 @@
 import os
 import sys
-import time
-import numpy as np
-
+import pandas as pd
 import ctypes
 import torch
-import torch.cuda.nvtx as nvtx
 
 os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
 os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -114,13 +111,18 @@ def register_model(model, should_tag_hooks=None):
 
 
 def run_batch_infer(model_name, prompts, enable_pc=False):    
-    sampling_params = SamplingParams(temperature=0.8, top_p=0.95, max_tokens=2048)
+    sampling_params = SamplingParams(
+        temperature=0.8, 
+        seed=42,
+        top_p=0.95, 
+        max_tokens=2048)
 
     llm = LLM(
         model=model_name,
         enforce_eager=True,
         enable_prefix_caching=enable_pc,
-        gpu_memory_utilization=0.8
+        gpu_memory_utilization=0.9,
+        disable_log_stats=False
     )
 
     print("Loaded llm, begin register...")
@@ -134,35 +136,44 @@ def run_batch_infer(model_name, prompts, enable_pc=False):
     
     print("Finished warmup, begin profiling...")
 
-    torch.cuda.cudart().cudaProfilerStart()
+    # torch.cuda.cudart().cudaProfilerStart()
 
     outputs = llm.chat(
         [[{"role": "user", "content": p}] for p in prompts],
         sampling_params,
         chat_template_kwargs={"enable_thinking": False})
     
-    torch.cuda.cudart().cudaProfilerStop()
-  
+    # torch.cuda.cudart().cudaProfilerStop()
+
+    # for o in outputs:
+    #     ttft = o.metrics.first_token_latency
+    #     tpot = (o.metrics.last_token_ts - o.metrics.first_token_ts) / (o.metrics.num_generation_tokens - 1)
+    #     print("TTFT: ", ttft, ", TPOT: ", tpot)
+    
     return [o.outputs[0].text for o in outputs]
 
 
 if __name__ == "__main__":
     model_name = sys.argv[1]
-    # prompts = sys.argv[2:]
     
-    prompts = [
-        # "What was the number one best-selling album of the 1980s?",
-        "Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.",
-        "I want you to act as a linux terminal. I will type commands and you will reply with what the terminal should show. I want you to only reply with the terminal output inside one unique code block, and nothing else. do not write explanations. do not type commands unless I instruct you to do so. when i need to tell you something in english, i will do so by putting text inside curly brackets {like this}. my first command is pwd",
-        "I want you to act as an English translator, spelling corrector and improver. I will speak to you in any language and you will detect the language, translate it and answer in the corrected and improved version of my text, in English. I want you to replace my simplified A0-level words and sentences with more beautiful and elegant, upper level English words and sentences. Keep the meaning same, but make them more literary. I want you to only reply the correction, the improvements and nothing else, do not write explanations. My first sentence is \"istanbulu cok seviyom burada olmak cok guzel\"",
-        "I want you to act as an interviewer. I will be the candidate and you will ask me the interview questions for the ${Position:Software Developer} position. I want you to only reply as the interviewer. Do not write all the conversation at once. I want you to only do the interview with me. Ask me the questions and wait for my answers. Do not write explanations. Ask me the questions one by one like an interviewer does and wait for my answers. My first sentence is \"Hi\"",
-        "I want you to act as a javascript console. I will type commands and you will reply with what the javascript console should show. I want you to only reply with the terminal output inside one unique code block, and nothing else. do not write explanations. do not type commands unless I instruct you to do so. when i need to tell you something in english, i will do so by putting text inside curly brackets {like this}. my first command is console.log(\"Hello World\");"
-    ]
+    dataset_df = pd.read_csv("hf://datasets/fka/prompts.chat/prompts.csv")
+    prompts = dataset_df["prompt"].sample(n=1000, random_state=42).tolist()
+    
+    # prompts = [
+    #     "Imagine you are an experienced Ethereum developer tasked with creating a smart contract for a blockchain messenger. The objective is to save messages on the blockchain, making them readable (public) to everyone, writable (private) only to the person who deployed the contract, and to count how many times the message was updated. Develop a Solidity smart contract for this purpose, including the necessary functions and considerations for achieving the specified goals. Please provide the code and any relevant explanations to ensure a clear understanding of the implementation.",
+    #     "I want you to act as a linux terminal. I will type commands and you will reply with what the terminal should show. I want you to only reply with the terminal output inside one unique code block, and nothing else. do not write explanations. do not type commands unless I instruct you to do so. when i need to tell you something in english, i will do so by putting text inside curly brackets {like this}. my first command is pwd",
+    #     "I want you to act as an English translator, spelling corrector and improver. I will speak to you in any language and you will detect the language, translate it and answer in the corrected and improved version of my text, in English. I want you to replace my simplified A0-level words and sentences with more beautiful and elegant, upper level English words and sentences. Keep the meaning same, but make them more literary. I want you to only reply the correction, the improvements and nothing else, do not write explanations. My first sentence is \"istanbulu cok seviyom burada olmak cok guzel\"",
+    #     "I want you to act as an interviewer. I will be the candidate and you will ask me the interview questions for the ${Position:Software Developer} position. I want you to only reply as the interviewer. Do not write all the conversation at once. I want you to only do the interview with me. Ask me the questions and wait for my answers. Do not write explanations. Ask me the questions one by one like an interviewer does and wait for my answers. My first sentence is \"Hi\"",
+    #     "I want you to act as a javascript console. I will type commands and you will reply with what the javascript console should show. I want you to only reply with the terminal output inside one unique code block, and nothing else. do not write explanations. do not type commands unless I instruct you to do so. when i need to tell you something in english, i will do so by putting text inside curly brackets {like this}. my first command is console.log(\"Hello World\");"
+    # ]
 
     print(f"Received {model_name}, starting load...")
     
     data = run_batch_infer(model_name, prompts)
-    print(data) 
+
+    with open("out.txt", "w") as f:
+        f.write("\n\n".join(data))
+        f.close()
 
     agent.sched_flush_timing.argtypes = []
     agent.sched_flush_timing()

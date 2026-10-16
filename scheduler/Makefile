@@ -10,7 +10,7 @@ sched:
 	g++ -std=c++20 -o scheduler_daemon scheduler_daemon.cpp -lpthread -lrt
 
 clean-sched:
-	rm -f /dev/shm/kernel_sched_shm_v4
+	rm -f /dev/shm/kernel_sched_shm_*
 	rm scheduler_daemon 
 	
 clean-simple:
