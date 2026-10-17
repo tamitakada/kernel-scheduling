@@ -1,3 +1,25 @@
+"""
+Scheduler / prefetch hooks, shared by the offline driver (run_vllm_exp.py) and the online vLLM worker (sched_worker.py).
+
+This is the module-registration logic that used to live in run_vllm_exp.py, unchanged in behaviour, plus what a
+long-running server needs: a periodic flush of the agent's timing rows (they are held in memory until flushed) and a
+single shutdown path.
+
+Two modes, chosen by SCHED_NO_CUPTI:
+  default            CUPTI path. Tag hooks push/pop "layer_<i>/<module>"; the agent's launch callback reads the tag, the
+                     SCHEDULER (daemon) decides per launch whether to prefetch, the agent prefetches that module's weights.
+  SCHED_NO_CUPTI=1   Prefetch pre-hooks: every module with weights prefetches them itself right before it runs.
+
+Environment: SCHED_AGENT_SO (path to agent.so, default ./agent.so), SCHED_NO_CUPTI,
+             SCHED_FLUSH_INTERVAL_S (online only; default 0 = write the timing log ONCE, at shutdown. Set e.g. 300 to
+             also write it periodically, which bounds memory in a very long run),
+             SCHED_FLUSH_IDLE_S (online only; default 5: write the timing log once, this many seconds after the
+             engine goes idle following activity; 0 disables),
+             SCHED_FLUSH_TRIGGER (online only; default ./sched_flush_now: `touch` that file and the worker writes the
+             timing log immediately, without stopping. Set to "" to disable).
+Every important event is also appended to sched_trace.log (in SCHED_LOG_DIR, default the current directory), so what
+happened is visible even when terminal output is lost.
+"""
 import atexit
 import ctypes
 import multiprocessing.util
@@ -313,12 +335,14 @@ def _register_exit_hooks():
         _say(f"could not register the multiprocessing exit finalizer: {e!r}")
 
 
-def install(model):
-    """Online entry point: call once per worker process after the model is loaded."""
-    n_layers, n_tensors = register_model(model)
-    if not getattr(model, "_sched_activity", False):               # one cheap counter bump per forward pass
-        _find_layers(model)[0].register_forward_pre_hook(_activity_hook)
-        model._sched_activity = True
+def install_flush(activity_module, what):
+    """The timing-log half of install(): the idle watcher (it counts forward passes of `activity_module`), the optional
+    timer, the on-demand trigger file and the exit hooks. It registers no weights and hooks no layers. For a model the tag
+    and prefetch hooks do not cover (Whisper), kernel interception comes from the preloaded agent alone, and this is all
+    the worker has to add: without it the timing rows would never be written."""
+    if not getattr(activity_module, "_sched_activity", False):    # one cheap counter bump per forward pass
+        activity_module.register_forward_pre_hook(_activity_hook)
+        activity_module._sched_activity = True
     interval = float(os.environ.get("SCHED_FLUSH_INTERVAL_S", "0"))
     start_periodic_flush(interval)
     idle = float(os.environ.get("SCHED_FLUSH_IDLE_S", "5"))
@@ -327,7 +351,6 @@ def install(model):
     trigger_path = os.path.abspath(trigger) if trigger not in ("", "0") else None
     start_flush_trigger(trigger_path)
     _register_exit_hooks()
-    mode = "prefetch pre-hooks (SCHED_NO_CUPTI)" if _env_flag("SCHED_NO_CUPTI") else "tag hooks (CUPTI path, scheduler decides)"
     parts = []
     if idle > 0:
         parts.append(f"{idle:g}s after the engine goes idle")
@@ -336,6 +359,13 @@ def install(model):
     parts.append("at shutdown")
     if trigger_path:
         parts.append(f"on demand (touch {trigger_path})")
-    _say(f"{mode}; {n_layers} layers, {n_tensors} tensors registered; timing log written: {', '.join(parts)}")
+    _say(f"{what}; timing log written: {', '.join(parts)}")
     if _env_flag("SCHED_L2_PERSIST"):       # a leftover export from an earlier experiment would otherwise be a silent no-op
         _say("WARNING: SCHED_L2_PERSIST is set but this agent has no L2 persistence support; ignored.")
+
+
+def install(model):
+    """Online entry point for the LLM: call once per worker process after the model is loaded."""
+    n_layers, n_tensors = register_model(model)
+    mode = "prefetch pre-hooks (SCHED_NO_CUPTI)" if _env_flag("SCHED_NO_CUPTI") else "tag hooks (CUPTI path, scheduler decides)"
+    install_flush(_find_layers(model)[0], f"{mode}; {n_layers} layers, {n_tensors} tensors registered")

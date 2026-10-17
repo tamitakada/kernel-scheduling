@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 #include <atomic>
 #include <dlfcn.h>
@@ -97,8 +98,30 @@ thread_local int t_current_inflight_slot = -1;
  * driver thread. They must be fast and must NOT make any CUDA API calls.
  * ====================================================================== */
 
-static void CUDA_CB launch_completion_callback(void* userdata) {
-    int idx = static_cast<int>(reinterpret_cast<intptr_t>(userdata));
+// Host wall clock used for the start_ns / end_ns columns of the timing log: CLOCK_MONOTONIC, nanoseconds. It is system-wide, so
+// rows from different processes (the LLM server, the Whisper server) can be compared directly, and it is the clock behind
+// Python's time.monotonic_ns() / perf_counter_ns() on Linux.
+static inline uint64_t mono_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+static void timing_stamp_end(int idx, uint32_t gen, uint64_t now_ns);   // defined with the timing slots below
+
+// What the completion callback is told (one pointer-sized word): which daemon inflight slot to clear, and which timing slot
+// (and which generation of it) to stamp with the kernel's end time. Fields are stored +1 so that -1 ("none") fits.
+static_assert(sizeof(void*) == 8, "the completion word packs three fields into 64 bits");
+static inline void* pack_completion(int inflight_idx, int timing_idx, uint32_t timing_gen) {
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(
+        (static_cast<uint64_t>(timing_gen) << 32) |
+        (static_cast<uint64_t>(static_cast<uint16_t>(timing_idx + 1)) << 16) |
+        static_cast<uint64_t>(static_cast<uint16_t>(inflight_idx + 1))));
+}
+
+// Frees the daemon's idle gate. Also what the "could not track completion" fallbacks call: there the kernel may well still be
+// running, so they must not stamp an end time.
+static void release_inflight_slot(int idx) {
     if (idx >= 0 && idx < MAX_INFLIGHT) {
         g_state->inflight[idx].active.store(0);
     }
@@ -108,6 +131,15 @@ static void CUDA_CB launch_completion_callback(void* userdata) {
     // compared to trying to determine "am I the last one" without holding
     // the lock from inside a driver callback thread.
     sem_post(&g_state->new_request_sem);
+}
+
+static void CUDA_CB launch_completion_callback(void* userdata) {
+    const uint64_t now = mono_ns();          // first thing: this instant is the kernel's end_ns in the timing log
+    const uint64_t u = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(userdata));
+    timing_stamp_end(static_cast<int>((u >> 16) & 0xFFFF) - 1, static_cast<uint32_t>(u >> 32), now);
+    const int infl = static_cast<int>(u & 0xFFFF) - 1;
+    if (infl >= 0 && infl < MAX_INFLIGHT) g_state->inflight[infl].end_ns.store(now, std::memory_order_release);   // the daemon logs it
+    release_inflight_slot(infl);
 }
 
 /* ======================================================================
@@ -400,6 +432,12 @@ static std::string check_args_advisory(const LaunchArgs& a, const PrefetchPlan& 
  * slots whose real_end has completed (non-blocking cuEventQuery), and
  * sched_flush_timing() resolves the rest and writes the file. No CUDA call
  * is made from the cuLaunchHostFunc driver thread.
+ *
+ * Wall-clock timestamps (start_ns, end_ns, CLOCK_MONOTONIC): start_ns is read just before real_start is queued, end_ns in the
+ * completion callback, which fires right after real_end. The kernel's whole GPU execution therefore lies inside
+ * [start_ns, end_ns], and end_ns - start_ns exceeds kernel_us by the launch and callback latency (tens of microseconds on an
+ * idle GPU, more if the stream was busy). They are host readings, not GPU-clock times: that keeps rows from different
+ * processes comparable (no per-process clock calibration, no drift). end_ns is blank if no callback was seen.
  * ====================================================================== */
 
 constexpr int TIMING_POOL = 1024;   // max launches whose timing is unresolved at once
@@ -414,6 +452,11 @@ struct TimingSlot {
     std::string args_check;   // advisory: "-" (nothing prefetched), HIT, OTHER:<tag> or NONE
     size_t      pf_bytes = 0; // bytes actually prefetched (after the cap)
     std::string pf_tensors;   // tensors prefetched, joined with "+"
+    uint64_t start_ns = 0;                   // mono_ns() just before real_start was queued
+    std::atomic<uint64_t> end_ns{0};         // mono_ns() when the completion callback ran; 0 = not (yet) seen
+    std::atomic<uint32_t> gen{0};            // bumped at every acquire, so a late callback cannot stamp a recycled slot
+    uint64_t batch_id = 0;                   // the scheduler's batch this kernel was released in (0 = launched unscheduled)
+    int      batch_size = 0, batch_pos = 0;
 };
 
 struct TimingResult {
@@ -421,7 +464,13 @@ struct TimingResult {
     float kernel_ms; bool has_pf; float pf_ms; float gap_ms;
     std::string hook_tag, args_check;
     size_t pf_bytes; std::string pf_tensors;
+    uint64_t start_ns, end_ns;
+    uint64_t batch_id; int batch_size, batch_pos;
 };
+
+// Stored in end_ns by the fallbacks that free the gate WITHOUT a completion callback (cuLaunchHostFunc failed): no end time
+// will ever come, so the slot may be recycled at once, and the row's end_ns stays blank.
+static constexpr uint64_t NO_END_NS = ~0ull;
 
 // Heap-allocated and never freed, so nothing depends on static destruction order.
 static std::mutex*                g_timing_mu      = new std::mutex;
@@ -448,11 +497,22 @@ static void timing_finish(const TimingSlot& t) {
     r.args_check = t.args_check;
     r.pf_bytes   = t.pf_bytes;
     r.pf_tensors = t.pf_tensors;
+    r.start_ns   = t.start_ns;
+    r.end_ns     = t.end_ns.load(std::memory_order_acquire);
+    if (r.end_ns == NO_END_NS) r.end_ns = 0;
+    r.batch_id = t.batch_id; r.batch_size = t.batch_size; r.batch_pos = t.batch_pos;
     r.kernel_ms = event_ms(t.real_start, t.real_end);
     r.has_pf    = t.has_pf;
     r.pf_ms     = t.has_pf ? event_ms(t.pf_start, t.pf_end)    : 0.f;
     r.gap_ms    = t.has_pf ? event_ms(t.pf_end,   t.real_start) : 0.f;  // should be >= 0 if ordering holds
     g_timing_results->push_back(r);
+}
+
+// Runs on the driver's callback thread: atomics only, no lock, no CUDA call.
+static void timing_stamp_end(int idx, uint32_t gen, uint64_t now_ns) {
+    if (idx < 0 || idx >= TIMING_POOL) return;
+    TimingSlot& t = g_timing[idx];
+    if (t.gen.load(std::memory_order_acquire) == gen) t.end_ns.store(now_ns, std::memory_order_release);
 }
 
 static bool timing_create_events(TimingSlot& t) {
@@ -473,6 +533,9 @@ static void timing_resolve_ready() {
         TimingSlot& t = g_timing[idx];
         // real_end completing implies pf_end did too: the app stream waits on pf_end first.
         if (cuEventQuery(t.real_end) != CUDA_SUCCESS) break;
+        // The completion callback (it stamps end_ns) runs just after the end event. Recycle only once it has, so it can never
+        // stamp a recycled slot; but give up after 2 s so a callback that never comes cannot block the pool.
+        if (t.end_ns.load(std::memory_order_acquire) == 0 && mono_ns() - t.start_ns < 2000000000ull) break;
         timing_finish(t);
         t.state = 0;
         g_timing_pending->pop_front();
@@ -489,6 +552,10 @@ static int timing_acquire(int kernel_id, const char* name) {
         if (t.state != 0) continue;
         if (!timing_create_events(t)) break;
         t.state = 1;
+        t.start_ns = 0;
+        t.batch_id = 0; t.batch_size = 0; t.batch_pos = 0;
+        t.end_ns.store(0, std::memory_order_release);
+        t.gen.fetch_add(1, std::memory_order_acq_rel);     // after end_ns is cleared: a stale callback is now rejected
         t.kernel_id = kernel_id;
         t.has_pf = false;
         t.name = name;
@@ -535,6 +602,10 @@ extern "C" void sched_flush_timing() {
         g_timing_pending->clear();
     }
     for (int idx : todo) cuEventSynchronize(g_timing[idx].real_end);  // no lock held while waiting
+    // The completion callbacks run on a driver thread just after each end event; give the last ones a moment (bounded, shared).
+    const uint64_t give_up = mono_ns() + 200000000ull;
+    for (int idx : todo)
+        while (g_timing[idx].end_ns.load(std::memory_order_acquire) == 0 && mono_ns() < give_up) usleep(50);
 
     std::vector<TimingResult> out;
     long dropped = 0;
@@ -558,15 +629,18 @@ extern "C" void sched_flush_timing() {
         return;
     }
     if (!header_written) {
-        std::fputs("kernel_id\tkernel_us\tprefetch_us\tprefetch_to_kernel_gap_us\thook_tag\tprefetch_bytes\tprefetched_tensors\targs_check\tkernel_name\n", f);
+        std::fputs("kernel_id\tkernel_us\tprefetch_us\tprefetch_to_kernel_gap_us\thook_tag\tprefetch_bytes\tprefetched_tensors\targs_check\tkernel_name\tstart_ns\tend_ns\tbatch_id\tbatch_size\tbatch_pos\n", f);
         header_written = true;
     }
     for (const auto& r : out) {
         std::fprintf(f, "%d\t%.3f\t", r.kernel_id, r.kernel_ms * 1000.f);
         if (r.has_pf) std::fprintf(f, "%.3f\t%.3f\t", r.pf_ms * 1000.f, r.gap_ms * 1000.f);
         else          std::fputs("\t\t", f);
-        std::fprintf(f, "%s\t%zu\t%s\t%s\t%s\n", r.hook_tag.c_str(), r.pf_bytes,
-                     r.pf_tensors.c_str(), r.args_check.c_str(), r.name.c_str());
+        std::fprintf(f, "%s\t%zu\t%s\t%s\t%s\t%llu\t", r.hook_tag.c_str(), r.pf_bytes,
+                     r.pf_tensors.c_str(), r.args_check.c_str(), r.name.c_str(),
+                     static_cast<unsigned long long>(r.start_ns));
+        if (r.end_ns) std::fprintf(f, "%llu", static_cast<unsigned long long>(r.end_ns));
+        std::fprintf(f, "\t%llu\t%d\t%d\n", static_cast<unsigned long long>(r.batch_id), r.batch_size, r.batch_pos);
     }
     std::fclose(f);
     std::fprintf(stderr, "[agent pid=%d] wrote %zu timing rows to %s (dropped=%ld)\n",
@@ -738,6 +812,11 @@ static void request_launch_permission(const char* kernel_name, const char* layer
     g_state->slots[slot].inflight_slot = -1;
     g_state->slots[slot].kernel_id = 0;
     g_state->slots[slot].do_prefetch = -1;   // the daemon fills in 1 (prefetch) or 0 (don't) before it releases us
+    g_state->slots[slot].agent_kernel_id = kernel_id;   // lets the daemon's decision log name this kernel: (pid, kernel_id)
+    g_state->slots[slot].batch_id = 0;                  // the daemon fills these in before it releases us
+    g_state->slots[slot].batch_size = 0;
+    g_state->slots[slot].batch_pos = 0;
+    g_state->slots[slot].request_ns = mono_ns();
     pthread_mutex_unlock(&g_state->mutex);
 
     sem_post(&g_state->new_request_sem);     // wake the daemon
@@ -746,6 +825,8 @@ static void request_launch_permission(const char* kernel_name, const char* layer
     pthread_mutex_lock(&g_state->mutex);
     t_current_inflight_slot = g_state->slots[slot].inflight_slot; // carry through to EXIT
     int do_prefetch = g_state->slots[slot].do_prefetch;           // the scheduler's decision; copy it BEFORE the slot is recycled
+    const uint64_t batch_id = g_state->slots[slot].batch_id;      // which batch the scheduler released us in, likewise
+    const int batch_size = g_state->slots[slot].batch_size, batch_pos = g_state->slots[slot].batch_pos;
     g_state->slots[slot].active = 0;
     pthread_mutex_unlock(&g_state->mutex);
 
@@ -797,6 +878,9 @@ static void request_launch_permission(const char* kernel_name, const char* layer
         g_timing[t_timing_slot].args_check = args_check;
         g_timing[t_timing_slot].pf_bytes   = plan.total_bytes;
         g_timing[t_timing_slot].pf_tensors = prefetched_tensors;
+        g_timing[t_timing_slot].batch_id   = batch_id;
+        g_timing[t_timing_slot].batch_size = batch_size;
+        g_timing[t_timing_slot].batch_pos  = batch_pos;
     }
 
     if (!plan.segs.empty()) {
@@ -804,7 +888,10 @@ static void request_launch_permission(const char* kernel_name, const char* layer
     }
 
     // real_start goes AFTER the prefetch wait, so the real kernel's interval excludes the prefetch.
-    if (t_timing_slot >= 0) cuEventRecord(g_timing[t_timing_slot].real_start, app_stream);
+    if (t_timing_slot >= 0) {
+        g_timing[t_timing_slot].start_ns = mono_ns();     // BEFORE the event: the kernel cannot start earlier than this
+        cuEventRecord(g_timing[t_timing_slot].real_start, app_stream);
+    }
 }
 
 /* ======================================================================
@@ -845,8 +932,9 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
         CUstream stream = 0;
         bool resolved = launch_stream(cbid, data->functionParams, &stream);
 
-        void* userdata_for_completion = reinterpret_cast<void*>(
-            static_cast<intptr_t>(t_current_inflight_slot));
+        const int ts_idx = t_timing_slot;                                  // timing_mark_end() resets it
+        const uint32_t ts_gen = ts_idx >= 0 ? g_timing[ts_idx].gen.load(std::memory_order_acquire) : 0;
+        void* userdata_for_completion = pack_completion(t_current_inflight_slot, ts_idx, ts_gen);
 
         if (resolved) {
             timing_mark_end(stream);
@@ -859,13 +947,14 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
                 std::fprintf(stderr, "[agent pid=%d] WARNING: cuLaunchHostFunc failed (%d) for "
                                 "stream=%p cbid=%d, clearing inflight slot immediately\n",
                                 getpid(), hf_res, static_cast<void*>(stream), static_cast<int>(cbid));
-                launch_completion_callback(userdata_for_completion);
+                timing_stamp_end(ts_idx, ts_gen, NO_END_NS);              // no callback will come: recycle the slot, leave end_ns blank
+                release_inflight_slot(t_current_inflight_slot);           // the kernel may still be running
             }
         } else {
             std::fprintf(stderr, "[agent pid=%d] WARNING: couldn't resolve stream for "
                             "completion tracking (cbid=%d), clearing inflight slot immediately\n",
                             getpid(), static_cast<int>(cbid));
-            launch_completion_callback(userdata_for_completion);
+            release_inflight_slot(t_current_inflight_slot);
         }
     }
 }

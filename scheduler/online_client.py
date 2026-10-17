@@ -1,15 +1,39 @@
 #!/usr/bin/env python3
+"""
+Open-loop load generator for two running `vllm serve` processes sharing one GPU, driven by SPEECH: the first n utterances of
+LibriSpeech test-clean (openslr/librispeech_asr, streamed) arrive on a schedule (Poisson or fixed rate), NOT all at once. Each one is
+sent to the Whisper server (serve_whisper.sh, /v1/audio/transcriptions) and the transcript goes to the LLM server
+(serve_online.sh, /v1/chat/completions) as the request, streamed so that time-to-first-token and per-token timing are observed
+the way a user sees them.
 
+  python online_client.py --num-requests 50 --rate 2 --max-tokens 128 --temperature 0 --ignore-eos --no-thinking \\
+         --out results.csv
+
+Start scheduler_daemon, the LLM server and the Whisper server first (see serve_whisper.sh for the order and the memory
+split). The client is plain HTTP: it needs `datasets` to stream LibriSpeech and nothing else; nothing is written to disk. There is no warm-up: the first
+requests include first-use costs.
+
+Reports, per request and averaged:
+  TTFT  time from sending the transcript to the first content chunk (client side: includes HTTP, queueing, prefill)
+  TPOT  (time of last token - time of first token) / (output tokens - 1), the usual definition; the first token belongs
+        to TTFT. Output tokens come from the server's usage report. This assumes one token per streamed chunk (vLLM's
+        default); if chunks carry k tokens, TPOT reads low by up to about (k-1)/(n-1) of itself.
+  ASR   the Whisper request's round trip (it includes the Whisper server's own queueing), and the end-to-end TTFT from the
+        utterance's arrival to the first LLM token.
+Averages are per-request means; the token-weighted TPOT (total decode time / total decode tokens) is shown as well.
+
+It also scrapes the LLM server's Prometheus histograms before and after the measured run and prints its server-side mean
+TTFT / TPOT (delta of _sum over delta of _count), which is what vLLM itself recorded for these requests.
+Everything the scheduler adds (kernel queueing, ...) is inside both views, since both are wall-clock.
+"""
 import argparse
 import asyncio
 import csv
 import json
 import math
 import random
-import statistics
 import sys
 import time
-import pandas as pd
 
 import aiohttp
 
@@ -49,7 +73,6 @@ async def one_request(session, url, body, t0, offset, idx):
         async with session.post(url, json=body) as resp:
             if resp.status != 200:
                 raise RuntimeError(f"HTTP {resp.status}: {(await resp.text())[:200]}")
-            
             async for raw in resp.content:
                 line = raw.decode("utf-8", "replace").strip()
                 if not line.startswith("data:"):
@@ -130,34 +153,102 @@ def summarize(results, wall_s):
     }
 
 
+def sample_librispeech(n):
+    """The first n LibriSpeech test-clean utterances as (ids, raw FLAC bytes). Streamed: nothing is downloaded in full or
+    cached on disk. decode=False hands over each utterance's FLAC file as stored (and keeps `datasets` from decoding it)."""
+    from datasets import Audio, load_dataset
+    rows = list(load_dataset("openslr/librispeech_asr", "clean", split="test", streaming=True)
+                .cast_column("audio", Audio(decode=False)).take(n))
+    return [r["id"] for r in rows], [r["audio"]["bytes"] for r in rows]
+
+
+async def transcribe(session, base, model, flac, i):
+    """One request to the Whisper server. Returns (text, None) or (None, error)."""
+    form = aiohttp.FormData()
+    form.add_field("file", flac, filename=f"{i}.flac", content_type="audio/flac")
+    for k, v in (("model", model), ("language", "en"), ("response_format", "json"), ("temperature", "0")):
+        form.add_field(k, v)
+    try:
+        async with session.post(base + "/v1/audio/transcriptions", data=form) as resp:
+            if resp.status != 200:
+                return None, f"HTTP {resp.status}: {(await resp.text())[:200]}"
+            return ((await resp.json(content_type=None)).get("text") or "").strip(), None
+    except Exception as e:
+        return None, repr(e)
+
+
+def _stat_line(label, vals, note):
+    vals = sorted(vals)
+    if not vals:
+        return f"{label:<10} (no observations)"
+    return (f"{label:<10} mean {sum(vals) / len(vals) * 1000:9.1f} ms   p50 {percentile(vals, 50) * 1000:9.1f}   "
+            f"p90 {percentile(vals, 90) * 1000:9.1f}   p99 {percentile(vals, 99) * 1000:9.1f}   {note}")
+
+
+def print_asr_summary(results, asr_model):
+    failed = [r for r in results if (r["error"] or "").startswith("asr:")]
+    reached = [r for r in results if r["ttft_s"] is not None]
+    print(f"\n=== audio -> Whisper ({asr_model}) -> LLM: {len(results) - len(failed)}/{len(results)} transcribed, {len(reached)} answered ===")
+    print(_stat_line("ASR", [r["asr_s"] for r in results if r not in failed], "(round trip to the Whisper server, incl. its queueing)"))
+    print(_stat_line("E2E TTFT", [r["ttft_e2e_s"] for r in reached], "(audio arrival -> first LLM token)"))
+    if failed:
+        print(f"!! {len(failed)} request(s) failed in the ASR stage, e.g. {failed[0]['error']}")
+
+
 async def run(args):
-    dataset_df = pd.read_csv("hf://datasets/fka/prompts.chat/prompts.csv")
-    prompts = dataset_df["prompt"].sample(n=100, random_state=42).tolist()
-
-    base = args.url.rstrip("/")
+    ids, clips = sample_librispeech(args.num_requests)                    # before anything is measured: request i is utterance i (the split has
+                                                                       # 2620; a longer run goes round again)
+    base, asr_base = args.url.rstrip("/"), args.asr_url.rstrip("/")
     endpoint = base + "/v1/chat/completions"
-
     connector = aiohttp.TCPConnector(limit=0)                          # no cap on concurrent connections: open loop
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30)
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         model = await resolve_model(session, base, args.model)
+        try:                                                           # fail early, and say how to fix it, if Whisper is not up
+            asr_model = args.asr_model or await resolve_model(session, asr_base, None)
+            async with session.get(asr_base + "/v1/models") as resp:
+                resp.raise_for_status()
+        except (aiohttp.ClientError, OSError) as e:
+            raise SystemExit(f"error: cannot reach the Whisper server at {asr_base} ({e!r}); start serve_whisper.sh")
+
+        def body_for(text):
+            b = {"model": model, "messages": [{"role": "user", "content": text}],
+                 "max_tokens": args.max_tokens, "temperature": args.temperature, "stream": True,
+                 "stream_options": {"include_usage": True}}
+            if args.seed is not None:
+                b["seed"] = args.seed
+            if args.no_thinking:
+                b["chat_template_kwargs"] = {"enable_thinking": False}
+            if args.ignore_eos:
+                b["ignore_eos"] = True
+            return b
+
         before = await scrape(session, base) if args.scrape_metrics else None
-        offsets = arrival_offsets(len(prompts), args.rate, args.arrival, 42)
+        offsets = arrival_offsets(args.num_requests, args.rate, args.arrival, args.seed)
         t0 = time.perf_counter()
-        results = await asyncio.gather(*[
-            one_request(session, 
-                        endpoint, 
-                        {"model": model,
-                         "messages": [{"role": "user", "content": prompts[i]}],
-                         "max_tokens": 2048,
-                         "temperature": 0.0,
-                         "seed": 42,
-                         "chat_template_kwargs": {"enable_thinking": False},
-                         "ignore_eos": True,
-                         "stream": True,
-                         "stream_options": {"include_usage": True}}, 
-                        t0, off, i) 
-            for i, off in enumerate(offsets)])
+
+        async def audio_request(i, off):
+            """One arrival = one utterance: wait for its planned time, transcribe it, then send the transcript to the LLM."""
+            await asyncio.sleep(max(0.0, t0 + off - time.perf_counter()))      # open loop: the utterance arrives at the planned time
+            t_arr = time.perf_counter()
+            k = i % len(clips)
+            text, err = await transcribe(session, asr_base, asr_model, clips[k], i)
+            r = {"idx": i, "planned_s": off, "sent_s": t_arr - t0, "error": None, "n_tokens": 0, "ttft_s": None,
+                 "tpot_s": None, "e2e_s": 0.0, "llm_sent_s": None, "ttft_e2e_s": None, "total_s": None, "audio_id": ids[k],
+                 "asr_s": time.perf_counter() - t_arr, "transcript": text or "", "transcript_chars": len(text or "")}
+            if err or not text:
+                r["error"] = "asr: " + (err or "empty transcript")
+                r["total_s"] = time.perf_counter() - t_arr
+                return r
+            q = await one_request(session, endpoint, body_for(text), t0, time.perf_counter() - t0, i)         # sent at once
+            r.update(llm_sent_s=q["sent_s"], error=q["error"], n_tokens=q["n_tokens"], ttft_s=q["ttft_s"],
+                     tpot_s=q["tpot_s"], e2e_s=q["e2e_s"])
+            r["total_s"] = time.perf_counter() - t_arr
+            if q["ttft_s"] is not None:
+                r["ttft_e2e_s"] = (t0 + q["sent_s"] - t_arr) + q["ttft_s"]      # the Whisper round trip, then the LLM's TTFT
+            return r
+
+        results = await asyncio.gather(*[audio_request(i, off) for i, off in enumerate(offsets)])
         wall = time.perf_counter() - t0
         after = await scrape(session, base) if args.scrape_metrics else None
 
@@ -170,6 +261,7 @@ async def run(args):
     print(f"E2E   mean {s['e2e_mean']*1000:9.1f} ms   p99 {s['e2e_p99']*1000:9.1f}   |  {s['output_tokens']} output tokens, {s['throughput_tok_s']:.1f} tok/s")
     if s["errors"]:
         print(f"!! {s['errors']} request(s) failed, e.g. {next(r['error'] for r in results if r['error'])}")
+    print_asr_summary(results, asr_model)
     if before and after:
         print("--- server-side (vLLM's own histograms, delta over the measured run) ---")
         for n, label in (("vllm:time_to_first_token_seconds", "TTFT"), ("vllm:request_time_per_output_token_seconds", "TPOT (per-request mean)"),
@@ -181,25 +273,41 @@ async def run(args):
     if args.out:
         with open(args.out, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["idx", "planned_s", "sent_s", "ttft_s", "tpot_s", "e2e_s", "n_tokens", "error"])
+            w.writerow(["idx", "planned_s", "sent_s", "ttft_s", "tpot_s", "e2e_s", "n_tokens", "error",
+                        "llm_sent_s", "audio_id", "asr_s", "ttft_e2e_s", "total_s", "transcript_chars"])
+            f5 = lambda v: "" if v is None else f"{v:.5f}"
             for r in results:
-                w.writerow([r["idx"], f"{r['planned_s']:.4f}", f"{r['sent_s']:.4f}",
-                            "" if r["ttft_s"] is None else f"{r['ttft_s']:.5f}", "" if r["tpot_s"] is None else f"{r['tpot_s']:.6f}",
-                            f"{r['e2e_s']:.5f}", r["n_tokens"], r["error"] or ""])
+                w.writerow([r["idx"], f"{r['planned_s']:.4f}", f"{r['sent_s']:.4f}", f5(r["ttft_s"]),
+                            "" if r["tpot_s"] is None else f"{r['tpot_s']:.6f}", f"{r['e2e_s']:.5f}", r["n_tokens"], r["error"] or "",
+                            f5(r["llm_sent_s"]), r["audio_id"], f5(r["asr_s"]), f5(r["ttft_e2e_s"]), f5(r["total_s"]), r["transcript_chars"]])
         print(f"per-request rows written to {args.out}")
+    if args.transcripts_out:
+        with open(args.transcripts_out, "w") as f:
+            for r in results:
+                f.write(json.dumps({"idx": r["idx"], "audio_id": r["audio_id"], "transcript": r["transcript"],
+                                    "asr_s": r["asr_s"], "error": r["error"]}) + "\n")
+        print(f"transcripts written to {args.transcripts_out}")
     return s
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--url", default="http://localhost:8000")
-    ap.add_argument("--model", default=None, help="default: the first model the server lists")
+    ap.add_argument("--url", default="http://localhost:8000", help="the LLM server")
+    ap.add_argument("--model", default=None, help="default: the first model the LLM server lists")
+    ap.add_argument("--asr-url", default="http://localhost:8001", help="the Whisper server (serve_whisper.sh)")
+    ap.add_argument("--asr-model", default=None, help="default: the first model the Whisper server lists")
+    ap.add_argument("--num-requests", type=int, default=50, help="how many LibriSpeech utterances to take = how many requests")
     ap.add_argument("--rate", type=float, default=2.0, help="requests per second; 0 or inf = all at once")
     ap.add_argument("--arrival", choices=["poisson", "fixed"], default="poisson")
+    ap.add_argument("--max-tokens", type=int, default=128)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--seed", type=int, default=0, help="seeds the arrival process and the LLM sampling")
+    ap.add_argument("--ignore-eos", action="store_true", help="always generate max-tokens (equal lengths across runs)")
+    ap.add_argument("--no-thinking", action="store_true", help='send chat_template_kwargs {"enable_thinking": false} (Qwen3)')
     ap.add_argument("--no-scrape-metrics", dest="scrape_metrics", action="store_false")
     ap.add_argument("--out", default=None, help="CSV of per-request results")
-    args = ap.parse_args()
-    asyncio.run(run(args))
+    ap.add_argument("--transcripts-out", default=None, help="JSONL with the transcript and Whisper round trip of every request")
+    asyncio.run(run(ap.parse_args()))
 
 
 if __name__ == "__main__":
