@@ -8,9 +8,10 @@
 #include <semaphore.h>
 #include <sys/types.h>
 
-// v5: the structs below gained batching fields. A new name makes an agent built against the old layout fail at once
-// ("scheduler_daemon never started") instead of reading a segment with a different layout.
-constexpr const char* SHM_NAME = "/kernel_sched_shm_v5";
+// v7: PendingSlot gained the model tag (v6: the kernel's short name and launch dimensions; v5: the batching fields). A new name
+// makes an agent built against the old layout fail at once ("scheduler_daemon never started") instead of reading a segment
+// with a different layout.
+constexpr const char* SHM_NAME = "/kernel_sched_shm_v7";
 constexpr int MAX_PENDING  = 256;
 constexpr int MAX_INFLIGHT = 64;  // max kernels tracked as "currently executing" at once
 constexpr int MAX_REGIONS  = 1024;
@@ -35,6 +36,15 @@ struct PendingSlot {
     // Written by the AGENT before it posts the request (they let the daemon log say exactly which kernel it is):
     uint64_t request_ns;       // CLOCK_MONOTONIC when the launch was intercepted (the clock behind start_ns / end_ns in the agent log)
     int      agent_kernel_id;  // the agent's own per-process launch counter; with the pid it names a row of agent_<pid>_timing.tsv
+
+    // Written by the AGENT: what the daemon needs to look this kernel up in its table of profiled kernels. kernel_name above is
+    // cut to NAME_LEN, and half of the launches of a real run have longer symbols (cutlass, cub), so the agent, which sees the
+    // full symbol, reduces it to the short name NCU prints (see kernel_key.hpp).
+    char     kernel_base[NAME_LEN];
+    uint32_t grid[3];          // launch dimensions in blocks and threads; all zero if the agent could not read them
+    uint32_t block[3];
+    char     model[32];        // which model's kernel table applies to this process: the agent's SCHED_MODEL environment variable
+                               // ("qwen" or "whisper"); empty if it is not set
 
     // Written by the DAEMON before it sets ready=1: which batch this kernel was released in.
     uint64_t batch_id;         // 1, 2, 3, ...: kernels sharing a batch_id were released together

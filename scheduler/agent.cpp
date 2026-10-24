@@ -3,8 +3,10 @@
 
 #include "shared_state.hpp"
 
+#include <strings.h>
 #include <cuda.h>
 #include <cupti.h>
+#include "kernel_key.hpp"
 #include <nvrtc.h>
 #include <cerrno>
 #include <cstdint>
@@ -22,6 +24,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static SchedulerSharedState* g_state = nullptr;
@@ -221,6 +224,39 @@ static bool launch_stream(CUpti_CallbackId cbid, const void* params, CUstream* o
         if (cfg) { *out = cfg->hStream; return true; }
     }
     return false;
+}
+
+// The launch's grid and block dimensions, from either launch API's parameters (zeros if they cannot be read).
+struct LaunchDims { uint32_t grid[3] = {0, 0, 0}, block[3] = {0, 0, 0}; };
+
+static LaunchDims launch_dims(CUpti_CallbackId cbid, const void* params) {
+    LaunchDims d;
+    if (cbid == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel) {
+        const auto* p = reinterpret_cast<const cuLaunchKernel_params_min*>(params);
+        d.grid[0] = p->gx; d.grid[1] = p->gy; d.grid[2] = p->gz;
+        d.block[0] = p->bx; d.block[1] = p->by; d.block[2] = p->bz;
+    } else if (cbid == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx) {
+        const CUlaunchConfig* c = reinterpret_cast<const cuLaunchKernelEx_params_min*>(params)->config;
+        if (c) {
+            d.grid[0] = c->gridDimX; d.grid[1] = c->gridDimY; d.grid[2] = c->gridDimZ;
+            d.block[0] = c->blockDimX; d.block[1] = c->blockDimY; d.block[2] = c->blockDimZ;
+        }
+    }
+    return d;
+}
+
+// The model this process runs ("qwen" / "whisper"), from SCHED_MODEL: it tells the daemon which kernel table to search.
+static const std::string& model_tag() {
+    static const std::string tag = [] { const char* e = std::getenv("SCHED_MODEL"); return std::string(e ? e : ""); }();
+    return tag;
+}
+
+// ncu_function_base() demangles and parses a symbol of up to a few hundred characters: do it once per distinct symbol.
+static const std::string& kernel_base_name(const char* symbol) {
+    static thread_local std::unordered_map<std::string, std::string> cache;
+    auto it = cache.find(symbol);
+    if (it == cache.end()) it = cache.emplace(symbol, ncu_function_base(symbol)).first;
+    return it->second;
 }
 
 constexpr int NUM_PREFETCH_STREAMS = 4;
@@ -457,6 +493,8 @@ struct TimingSlot {
     std::atomic<uint32_t> gen{0};            // bumped at every acquire, so a late callback cannot stamp a recycled slot
     uint64_t batch_id = 0;                   // the scheduler's batch this kernel was released in (0 = launched unscheduled)
     int      batch_size = 0, batch_pos = 0;
+    uint32_t block[3] = {0, 0, 0};           // the launch's block dimensions
+    uint32_t grid[3]  = {0, 0, 0};           // and grid dimensions
 };
 
 struct TimingResult {
@@ -466,6 +504,7 @@ struct TimingResult {
     size_t pf_bytes; std::string pf_tensors;
     uint64_t start_ns, end_ns;
     uint64_t batch_id; int batch_size, batch_pos;
+    uint32_t block[3], grid[3];
 };
 
 // Stored in end_ns by the fallbacks that free the gate WITHOUT a completion callback (cuLaunchHostFunc failed): no end time
@@ -482,6 +521,21 @@ static long                       g_timing_dropped = 0;
 
 // The timing slot of the launch currently between ENTER and EXIT on this thread.
 thread_local int t_timing_slot = -1;
+
+// SCHED_LOG (the daemon and sched_hooks.py read the same variable): full (default) | decisions | off.
+// The CUDA-event timing of every kernel, and the timing log built from it, exist only at "full": two cuEventRecord calls, a mutex and some string
+// copies per launch are CPU time on the launching thread, and the agent is CPU-bound in eager mode. "decisions" and "off" skip all of it; the
+// kernels are still intercepted and scheduled exactly as before (the daemon's own logging at "decisions" is a separate matter, see the daemon).
+static bool timing_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("SCHED_LOG");
+        if (!e || !*e || !strcasecmp(e, "full") || !strcmp(e, "2") || !strcasecmp(e, "all")) return true;
+        if (!strcasecmp(e, "decisions") || !strcmp(e, "1") || !strcasecmp(e, "off") || !strcmp(e, "0") || !strcasecmp(e, "none")) return false;
+        std::fprintf(stderr, "[agent pid=%d] WARNING: SCHED_LOG=%s is not one of full, decisions, off: using full\n", getpid(), e);
+        return true;
+    }();
+    return on;
+}
 
 static float event_ms(CUevent a, CUevent b) {
     float ms = 0.f;
@@ -501,6 +555,8 @@ static void timing_finish(const TimingSlot& t) {
     r.end_ns     = t.end_ns.load(std::memory_order_acquire);
     if (r.end_ns == NO_END_NS) r.end_ns = 0;
     r.batch_id = t.batch_id; r.batch_size = t.batch_size; r.batch_pos = t.batch_pos;
+    std::memcpy(r.block, t.block, sizeof r.block);
+    std::memcpy(r.grid, t.grid, sizeof r.grid);
     r.kernel_ms = event_ms(t.real_start, t.real_end);
     r.has_pf    = t.has_pf;
     r.pf_ms     = t.has_pf ? event_ms(t.pf_start, t.pf_end)    : 0.f;
@@ -585,6 +641,10 @@ static void timing_mark_end(CUstream stream) {
 // Blocks until every recorded kernel has finished, then appends rows to
 // <SCHED_LOG_DIR or .>/agent_<pid>_timing.tsv (sort by kernel_id to match your log).
 extern "C" void sched_flush_timing() {
+    if (!timing_enabled()) {                  // SCHED_LOG is not "full": no timing slot was ever acquired, so there is nothing to wait for or write
+        std::fprintf(stderr, "[agent pid=%d] SCHED_LOG is not full: no timing rows were recorded, nothing to write\n", getpid());
+        return;
+    }
     std::fprintf(stderr, "[agent pid=%d] prefetch: kernels_prefetched=%ld kernels_skipped=%ld scheduler_denied=%ld "
                          "same_module_entry=%ld args_hit=%ld args_other=%ld args_none=%ld prefetched_bytes_total=%lld\n",
                  getpid(), g_pf_kernels.load(), g_pf_skipped.load(), g_pf_denied.load(), g_pf_dup.load(),
@@ -629,7 +689,7 @@ extern "C" void sched_flush_timing() {
         return;
     }
     if (!header_written) {
-        std::fputs("kernel_id\tkernel_us\tprefetch_us\tprefetch_to_kernel_gap_us\thook_tag\tprefetch_bytes\tprefetched_tensors\targs_check\tkernel_name\tstart_ns\tend_ns\tbatch_id\tbatch_size\tbatch_pos\n", f);
+        std::fputs("kernel_id\tkernel_us\tprefetch_us\tprefetch_to_kernel_gap_us\thook_tag\tprefetch_bytes\tprefetched_tensors\targs_check\tkernel_name\tstart_ns\tend_ns\tbatch_id\tbatch_size\tbatch_pos\tblock\tmodel\tgrid\n", f);
         header_written = true;
     }
     for (const auto& r : out) {
@@ -640,7 +700,8 @@ extern "C" void sched_flush_timing() {
                      r.pf_tensors.c_str(), r.args_check.c_str(), r.name.c_str(),
                      static_cast<unsigned long long>(r.start_ns));
         if (r.end_ns) std::fprintf(f, "%llu", static_cast<unsigned long long>(r.end_ns));
-        std::fprintf(f, "\t%llu\t%d\t%d\n", static_cast<unsigned long long>(r.batch_id), r.batch_size, r.batch_pos);
+        std::fprintf(f, "\t%llu\t%d\t%d\t(%u, %u, %u)\t%s\t(%u, %u, %u)\n", static_cast<unsigned long long>(r.batch_id), r.batch_size, r.batch_pos, r.block[0], r.block[1], r.block[2],
+                     model_tag().c_str(), r.grid[0], r.grid[1], r.grid[2]);
     }
     std::fclose(f);
     std::fprintf(stderr, "[agent pid=%d] wrote %zu timing rows to %s (dropped=%ld)\n",
@@ -785,7 +846,7 @@ extern "C" long long sched_prefetch_ranges(const unsigned long long* ptrs, const
 
 static void request_launch_permission(const char* kernel_name, const char* layer_tag,
                                       bool have_stream, CUstream app_stream,
-                                      const LaunchArgs& args, uint64_t entry_seq) {
+                                      const LaunchArgs& args, uint64_t entry_seq, const LaunchDims& dims) {
     t_timing_slot = -1;   // no timing for this launch unless a slot is acquired below
     pthread_mutex_lock(&g_state->mutex);
     int slot = -1;
@@ -807,6 +868,12 @@ static void request_launch_permission(const char* kernel_name, const char* layer
     g_state->slots[slot].pid = getpid();
     std::strncpy(g_state->slots[slot].kernel_name, kernel_name, NAME_LEN - 1);
     std::strncpy(g_state->slots[slot].layer_tag, layer_tag, NAME_LEN - 1);
+    std::strncpy(g_state->slots[slot].kernel_base, kernel_base_name(kernel_name).c_str(), NAME_LEN - 1);
+    g_state->slots[slot].kernel_base[NAME_LEN - 1] = '\0';
+    std::strncpy(g_state->slots[slot].model, model_tag().c_str(), sizeof g_state->slots[slot].model - 1);
+    g_state->slots[slot].model[sizeof g_state->slots[slot].model - 1] = '\0';
+    std::memcpy(g_state->slots[slot].grid, dims.grid, sizeof dims.grid);
+    std::memcpy(g_state->slots[slot].block, dims.block, sizeof dims.block);
     g_state->slots[slot].active = 1;
     g_state->slots[slot].ready = 0;
     g_state->slots[slot].inflight_slot = -1;
@@ -872,7 +939,7 @@ static void request_launch_permission(const char* kernel_name, const char* layer
     }
 
     // Timing: acquire BEFORE the prefetch so inject_prefetch can record its events in the slot.
-    t_timing_slot = have_stream ? timing_acquire(kernel_id, kernel_name) : -1;
+    t_timing_slot = (have_stream && timing_enabled()) ? timing_acquire(kernel_id, kernel_name) : -1;
     if (t_timing_slot >= 0) {
         g_timing[t_timing_slot].hook_tag   = layer_tag;
         g_timing[t_timing_slot].args_check = args_check;
@@ -881,6 +948,8 @@ static void request_launch_permission(const char* kernel_name, const char* layer
         g_timing[t_timing_slot].batch_id   = batch_id;
         g_timing[t_timing_slot].batch_size = batch_size;
         g_timing[t_timing_slot].batch_pos  = batch_pos;
+        std::memcpy(g_timing[t_timing_slot].block, dims.block, sizeof dims.block);
+        std::memcpy(g_timing[t_timing_slot].grid, dims.grid, sizeof dims.grid);
     }
 
     if (!plan.segs.empty()) {
@@ -923,7 +992,8 @@ static void CUPTIAPI cupti_callback(void* userdata, CUpti_CallbackDomain domain,
         LaunchArgs args;
         launch_args(cbid, data->functionParams, &args);
 
-        request_launch_permission(kernel_name, layer_tag, have_stream, app_stream, args, entry_seq);
+        request_launch_permission(kernel_name, layer_tag, have_stream, app_stream, args, entry_seq,
+                                  launch_dims(cbid, data->functionParams));
         // returning here lets CUPTI/the driver proceed with the real launch
         return;
     }
@@ -998,6 +1068,8 @@ static void agent_init() {
     // intercept CUDA kernel launches
     cuptiEnableCallback(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel);
     cuptiEnableCallback(1, g_subscriber, CUPTI_CB_DOMAIN_DRIVER_API, CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx);
+    if (!timing_enabled())
+        std::fprintf(stderr, "[agent pid=%d] SCHED_LOG=%s: no CUDA-event timing and no timing log (kernels are still intercepted and scheduled)\n", getpid(), std::getenv("SCHED_LOG"));
     g_cupti_active.store(true);
     std::fprintf(stderr, "[agent pid=%d] CUPTI subscriber attached\n", getpid());
 }

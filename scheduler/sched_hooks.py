@@ -195,7 +195,20 @@ def _say(msg):
         pass
 
 
+def _log_level():
+    """SCHED_LOG, the one variable the daemon, the agent and this module share: full (default) | decisions | off. Only \"full\" makes the
+    agent record CUDA-event timing, so only \"full\" has a timing log to write. Returns 2 (full), 1 (decisions) or 0 (off)."""
+    v = (os.environ.get("SCHED_LOG") or "full").strip().lower()
+    if v in ("off", "0", "none"):
+        return 0
+    if v in ("decisions", "1"):
+        return 1
+    return 2
+
+
 def flush_timing():
+    if _log_level() < 2:                      # nothing was recorded (see _log_level)
+        return
     with _flush_lock:                         # one flush at a time (timer vs trigger vs shutdown)
         agent.sched_flush_timing()
 
@@ -305,6 +318,8 @@ def shutdown(reason="shutdown"):
     finalizers, atexit): the first caller does the work and says why, later calls return at once. The agent has no
     exit-time flush of its own, so without this call the timing rows are lost."""
     global _shutdown_done
+    if _log_level() < 2:                      # nothing to flush, nothing was started
+        return
     with _shutdown_lock:
         if _shutdown_done:
             return
@@ -340,6 +355,11 @@ def install_flush(activity_module, what):
     timer, the on-demand trigger file and the exit hooks. It registers no weights and hooks no layers. For a model the tag
     and prefetch hooks do not cover (Whisper), kernel interception comes from the preloaded agent alone, and this is all
     the worker has to add: without it the timing rows would never be written."""
+    if _log_level() < 2:                      # no timing rows will exist: no idle watcher, timer, trigger file or exit flush, no counter hook
+        _say(f"{what}; timing log OFF (SCHED_LOG={os.environ.get('SCHED_LOG')})")
+        if _env_flag("SCHED_L2_PERSIST"):
+            _say("WARNING: SCHED_L2_PERSIST is set but this agent has no L2 persistence support; ignored.")
+        return
     if not getattr(activity_module, "_sched_activity", False):    # one cheap counter bump per forward pass
         activity_module.register_forward_pre_hook(_activity_hook)
         activity_module._sched_activity = True

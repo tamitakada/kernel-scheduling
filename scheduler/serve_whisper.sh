@@ -16,6 +16,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODEL="openai/whisper-large-v3"
 if [ $# -gt 0 ] && [[ "$1" != --* ]]; then MODEL="$1"; shift; fi
 
+export SCHED_MODEL=whisper                                          # the daemon searches the whisper table for this server's kernels
 export SCHED_AGENT_SO="${SCHED_AGENT_SO:-$HERE/agent.so}"           # absolute: the engine core is a separate process
 [ -f "$SCHED_AGENT_SO" ] || { echo "agent.so not found at $SCHED_AGENT_SO (build it, or set SCHED_AGENT_SO)" >&2; exit 1; }
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"                # the engine core imports sched_worker / sched_hooks by name
@@ -36,5 +37,8 @@ esac
 exec vllm serve "$MODEL" \
     --worker-cls sched_worker.SchedFlushWorker \
     --enforce-eager \
+    --no-enable-prefix-caching \
+    --max-num-seqs 1 \
+    --max-num-batched-tokens 1500 \
     --port "${PORT:-8001}" \
     "$@"
