@@ -9,6 +9,13 @@ simple:
 sched:
 	g++ -std=c++20 -o scheduler_daemon scheduler_daemon.cpp -lpthread -lrt
 
+pairprof:
+	g++ -std=c++20 -o pairprof_daemon pairprof_daemon.cpp -lpthread -lrt
+
+clean-pair:
+	rm -f /dev/shm/kernel_sched_shm_*
+	rm pairprof_daemon
+
 clean-sched:
 	rm -f /dev/shm/kernel_sched_shm_*
 	rm scheduler_daemon 
